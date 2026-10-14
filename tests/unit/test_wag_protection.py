@@ -2216,6 +2216,7 @@ store.run_engine('bing', caller='probe', deadline_mono=103.0,
             self.api.validate_settings({'enabled': False, 'enable': True})
 
     def test_manifest_unknown_field_and_shadow_file_refuse_before_build(self):
+        assert isinstance(self.manifest['files'], Mapping)
         for manifest in [
             {**self.manifest, 'surprise': True},
             {**self.manifest, 'files': {**self.manifest['files'], '../shadow.py': 'b' * 64}},
