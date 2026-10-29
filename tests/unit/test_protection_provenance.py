@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """Offline provenance gates; wheel/distribution fixtures are never installed or imported."""
 
+# pylint: disable=missing-class-docstring,invalid-name
+
 import base64
 import csv
 from hashlib import sha256
