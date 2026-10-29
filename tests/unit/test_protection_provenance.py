@@ -53,7 +53,9 @@ NATIVE_FILES = (
 class DependencyProvenanceTest(TestCase):
     def setUp(self):
         # Real, disposable distribution metadata, not a new runtime dependency.
-        self.temporary = tempfile.TemporaryDirectory(prefix="provenance-", dir=WORKSPACE)
+        self.temporary = tempfile.TemporaryDirectory(  # pylint: disable=consider-using-with
+            prefix="provenance-", dir=WORKSPACE
+        )
         self.addCleanup(self.temporary.cleanup)
         self.directory = Path(self.temporary.name)
         self.site = self.directory / "site"
