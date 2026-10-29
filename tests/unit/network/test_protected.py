@@ -204,9 +204,7 @@ class ProtectedTransportTest(unittest.TestCase):  # pylint: disable=too-many-pub
         settings.start()
         self.addCleanup(settings.stop)
         # addCleanup owns this directory even if the rest of setUp fails.
-        self.parent = tempfile.TemporaryDirectory(  # pylint: disable=consider-using-with
-            dir=os.environ['TMPDIR']
-        )
+        self.parent = tempfile.TemporaryDirectory(dir=os.environ['TMPDIR'])  # pylint: disable=consider-using-with
         self.addCleanup(self.parent.cleanup)
         self.root = Path(self.parent.name) / 'native-synthetic'
         import wag_protection
@@ -1199,10 +1197,14 @@ print(json.dumps({'reason': getattr(result, 'reason', None), 'calls': calls}))
         ]
         # cf-mitigated is authoritative even when a proxy removes/replaces Server.
         explicit_cases = [
-            case for case in cases
-            if case[0] in {
-                'cloudflare-unknown', 'cloudflare-200-unknown',
-                'cloudflare-200-empty', 'cloudflare-200-parser-error',
+            case
+            for case in cases
+            if case[0]
+            in {
+                'cloudflare-unknown',
+                'cloudflare-200-unknown',
+                'cloudflare-200-empty',
+                'cloudflare-200-parser-error',
             }
         ]
         for label, name, status, headers, body, outcome, floor in explicit_cases:

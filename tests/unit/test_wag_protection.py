@@ -213,9 +213,7 @@ class StoreTest(unittest.TestCase):  # pylint: disable=too-many-public-methods
 
         self.api = wag_protection
         # addCleanup owns this directory even if the rest of setUp fails.
-        self.parent = tempfile.TemporaryDirectory(  # pylint: disable=consider-using-with
-            dir=os.environ['TMPDIR']
-        )
+        self.parent = tempfile.TemporaryDirectory(dir=os.environ['TMPDIR'])  # pylint: disable=consider-using-with
         self.addCleanup(self.parent.cleanup)
         self.root = Path(self.parent.name) / 'synthetic-state'
         self.engines = registry()
@@ -1391,7 +1389,10 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
                     raise AssertionError('untyped proof callback executed')
 
             copied = self.api.RecoveryProofV1(
-                proof.version, proof.capability, proof.approved_manifest, proof.sender_bindings,
+                proof.version,
+                proof.capability,
+                proof.approved_manifest,
+                proof.sender_bindings,
                 # Deliberately copy the private witness to prove a counterfeit remains rejected.
                 proof._witness,  # pylint: disable=protected-access
             )
