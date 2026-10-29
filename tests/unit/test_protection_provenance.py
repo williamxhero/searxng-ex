@@ -51,9 +51,7 @@ NATIVE_FILES = (
 class DependencyProvenanceTest(TestCase):
     def setUp(self):
         # Real, disposable distribution metadata, not a new runtime dependency.
-        self.temporary = tempfile.TemporaryDirectory(
-            prefix="provenance-", dir=WORKSPACE
-        )
+        self.temporary = tempfile.TemporaryDirectory(prefix="provenance-", dir=WORKSPACE)
         self.addCleanup(self.temporary.cleanup)
         self.directory = Path(self.temporary.name)
         self.site = self.directory / "site"
@@ -62,10 +60,8 @@ class DependencyProvenanceTest(TestCase):
         self.payload = {
             PAYLOAD: b'"""Never imported test fixture."""\n',
             NATIVE_PAYLOAD: b"not executable: native byte identity fixture\n",
-            DIST_INFO
-            + "/METADATA": b"Metadata-Version: 2.1\nName: wag-provenance-fixture\nVersion: 1.2.3\n",
-            DIST_INFO
-            + "/WHEEL": b"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+            DIST_INFO + "/METADATA": b"Metadata-Version: 2.1\nName: wag-provenance-fixture\nVersion: 1.2.3\n",
+            DIST_INFO + "/WHEEL": b"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
         }
         self._write_wheel()
         self._write_installed()
@@ -77,19 +73,13 @@ class DependencyProvenanceTest(TestCase):
             return real_distribution(name)
 
         self.addCleanup(patch.stopall)
-        patch.object(
-            importlib.metadata, "distribution", side_effect=distribution
-        ).start()
+        patch.object(importlib.metadata, "distribution", side_effect=distribution).start()
 
     def _record(self):
         out = io.StringIO()
         writer = csv.writer(out, lineterminator="\n")
         for name, contents in self.payload.items():
-            digest = (
-                base64.urlsafe_b64encode(sha256(contents).digest())
-                .rstrip(b"=")
-                .decode("ascii")
-            )
+            digest = base64.urlsafe_b64encode(sha256(contents).digest()).rstrip(b"=").decode("ascii")
             writer.writerow([name, "sha256=" + digest, len(contents)])
         writer.writerow([DIST_INFO + "/RECORD", "", ""])
         return out.getvalue().encode("utf-8")
@@ -110,10 +100,7 @@ class DependencyProvenanceTest(TestCase):
             path.write_bytes(contents)
 
     def _manifest(self, mode="production"):
-        files = {
-            name: sha256((WORKSPACE / name).read_bytes()).hexdigest()
-            for name in NATIVE_FILES
-        }
+        files = {name: sha256((WORKSPACE / name).read_bytes()).hexdigest() for name in NATIVE_FILES}
         wheel_path = str(self.wheel.relative_to(WORKSPACE))
         files[wheel_path] = sha256(self.wheel.read_bytes()).hexdigest()
         registry = [
@@ -139,11 +126,7 @@ class DependencyProvenanceTest(TestCase):
             "python_digest": sha256(python.read_bytes()).hexdigest(),
             "module_root": str(WORKSPACE),
             "python_executable": str(python),
-            "root": str(
-                contract.PRODUCTION_ROOT
-                if mode == "production"
-                else self.directory / "state"
-            ),
+            "root": str(contract.PRODUCTION_ROOT if mode == "production" else self.directory / "state"),
             "shared_gid": 1000,
             "allowed_uids": sorted({0, os.getuid()}),
             "files": files,
@@ -156,23 +139,17 @@ class DependencyProvenanceTest(TestCase):
     @staticmethod
     def _seal(manifest):
         manifest["registry_digest"] = contract.json_digest(manifest["registry"])
-        manifest["artifact_digest"] = contract.json_digest(
-            {key: manifest[key] for key in contract.ARTIFACT_FIELDS}
-        )
+        manifest["artifact_digest"] = contract.json_digest({key: manifest[key] for key in contract.ARTIFACT_FIELDS})
         return manifest
 
     def _validate(self, manifest):
-        return contract.validate_manifest(
-            manifest, Path(manifest["root"]), manifest["mode"]
-        )
+        return contract.validate_manifest(manifest, Path(manifest["root"]), manifest["mode"])
 
     def test_production_rejects_empty_inventories(self):
         for missing in ("distributions", "wheels", "both"):
             with self.subTest(missing=missing):
                 manifest = self._manifest()
-                for key in (
-                    ("distributions", "wheels") if missing == "both" else (missing,)
-                ):
+                for key in ("distributions", "wheels") if missing == "both" else (missing,):
                     manifest[key] = {}
                 with self.assertRaises(ValueError):
                     self._validate(self._seal(manifest))
@@ -219,9 +196,7 @@ class DependencyProvenanceTest(TestCase):
             "distribution",
             side_effect=importlib.metadata.PackageNotFoundError,
         ):
-            with self.assertRaises(
-                (ValueError, importlib.metadata.PackageNotFoundError)
-            ):
+            with self.assertRaises((ValueError, importlib.metadata.PackageNotFoundError)):
                 self._validate(self._manifest())
 
     def test_production_rejects_same_version_different_installed_bytes(self):
@@ -238,9 +213,7 @@ class DependencyProvenanceTest(TestCase):
             self._validate(self._manifest())
 
     def test_production_rejects_wheel_metadata_mismatch(self):
-        self.payload[DIST_INFO + "/METADATA"] = self.payload[
-            DIST_INFO + "/METADATA"
-        ].replace(b"1.2.3", b"9.9.9")
+        self.payload[DIST_INFO + "/METADATA"] = self.payload[DIST_INFO + "/METADATA"].replace(b"1.2.3", b"9.9.9")
         self._write_wheel()
         self._write_installed()
         manifest = self._manifest()
@@ -254,9 +227,7 @@ class DependencyProvenanceTest(TestCase):
             self._validate(self._manifest())
 
     def test_production_rejects_undeclared_installed_payload(self):
-        (self.site / DIST_INFO / "RECORD").write_bytes(
-            self._record() + b"extra_backend.so,,\n"
-        )
+        (self.site / DIST_INFO / "RECORD").write_bytes(self._record() + b"extra_backend.so,,\n")
         (self.site / "extra_backend.so").write_bytes(b"not approved")
         with self.assertRaises(ValueError):
             self._validate(self._manifest())
