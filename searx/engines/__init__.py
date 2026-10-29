@@ -10,6 +10,8 @@ usage::
 
 import typing as t
 
+# pylint: disable=ungrouped-imports
+
 import sys
 import copy
 import os
@@ -21,6 +23,7 @@ import inspect
 import msgspec
 
 from searx import logger, settings
+from wag_protection import ProtectionError, Refusal
 from searx.utils import load_module
 from searx.data import ENGINE_TRAITS
 from searx.enginelib import Engine, EngineAbout
@@ -108,7 +111,7 @@ def load_engine(engine_data: dict[str, t.Any]) -> "Engine | types.ModuleType | N
     - required attribute is not set :py:func:`is_missing_required_attributes`
 
     """
-    # pylint: disable=too-many-return-statements
+    # pylint: disable=too-many-return-statements,too-many-branches
 
     engine_name = engine_data.get('name')
     if engine_name is None:
@@ -129,11 +132,22 @@ def load_engine(engine_data: dict[str, t.Any]) -> "Engine | types.ModuleType | N
         logger.error('The "engine" field is missing for the engine named "{}"'.format(engine_name))
         return None
     if settings['outgoing'].get('wag_protection', {}).get('enabled', False) is not False:
-        from searx.network.protected import validate_engine_settings  # pylint: disable=import-outside-toplevel
+        from searx.network.protected import (  # pylint: disable=import-outside-toplevel
+            get_store,
+            validate_engine_settings,
+            validate_engine_source,
+            validate_loaded_engine_source,
+        )
 
-        validate_engine_settings(engine_data)
+        approved = validate_engine_settings(engine_data)
+        expected_source = validate_engine_source(engine_data, ENGINE_DIR, approved)
     try:
         engine = load_module(module_name + '.py', ENGINE_DIR)
+        if settings['outgoing'].get('wag_protection', {}).get('enabled', False) is not False:
+            store = get_store()
+            if isinstance(store, Refusal):
+                raise ProtectionError(store.reason)
+            validate_loaded_engine_source(engine, expected_source, approved, store.manifest)
     except (SyntaxError, KeyboardInterrupt, SystemExit, SystemError, ImportError, RuntimeError):
         logger.exception('Fatal exception in engine "{}"'.format(module_name))
         sys.exit(1)

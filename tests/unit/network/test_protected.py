@@ -503,6 +503,39 @@ class ProtectedTransportTest(unittest.TestCase):  # pylint: disable=too-many-pub
                     self.assertEqual((root / 'ledger.sqlite').read_bytes(), before)
                     self.assertEqual(self.tls_server.headers, 0)
 
+    def test_engine_source_preflight_refuses_shadow_engine_directory(self):
+        import shutil
+        from searx import engines
+        from searx.network import protected
+
+        self.native_search_fixture()
+        shadow = Path(self.parent.name) / 'shadow-engines'
+        shadow.mkdir()
+        shutil.copy2(Path(engines.ENGINE_DIR) / 'bing.py', shadow / 'bing.py')
+        store = protected.get_store()
+        approved = next(entry for entry in store.manifest['registry'] if entry['engine'] == 'bing')
+        with patch.object(engines, 'ENGINE_DIR', str(shadow)):
+            with self.assertRaises(protected.ProtectionError) as error:
+                protected.validate_engine_source({'name': 'bing', 'engine': 'bing'}, engines.ENGINE_DIR, approved)
+        self.assertEqual(error.exception.reason, 'provenance_error')
+        self.assertEqual(self.tls_server.headers, 0)
+
+    def test_loaded_engine_source_recheck_refuses_shadow_module(self):
+        from searx import engines
+        from searx.network import protected
+
+        self.native_search_fixture()
+        store = protected.get_store()
+        approved = next(entry for entry in store.manifest['registry'] if entry['engine'] == 'bing')
+        expected = Path(engines.ENGINE_DIR) / 'bing.py'
+        shadow = Path(self.parent.name) / 'shadow-bing.py'
+        shadow.write_bytes(expected.read_bytes())
+        module = SimpleNamespace(__file__=str(shadow), __spec__=SimpleNamespace(origin=str(shadow)))
+        with self.assertRaises(protected.ProtectionError) as error:
+            protected.validate_loaded_engine_source(module, expected, approved, store.manifest)
+        self.assertEqual(error.exception.reason, 'provenance_error')
+        self.assertEqual(self.tls_server.headers, 0)
+
     def test_transport_rejects_incompatible_dependency_versions_before_connect(self):
         import httpcore
         import httpx

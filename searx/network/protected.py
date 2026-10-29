@@ -4,6 +4,7 @@
 import asyncio
 from collections.abc import AsyncIterator, Iterable, Iterator, Mapping
 from contextlib import contextmanager
+import hashlib
 import ipaddress
 from importlib.metadata import PackageNotFoundError
 from pathlib import Path
@@ -17,7 +18,7 @@ from httpcore._backends.base import SOCKET_OPTION
 import httpx
 
 from wag_protection import ProtectionError, Refusal, open_store, validate_settings
-from wag_protection.contract import json_digest, load_json, validate_manifest
+from wag_protection.contract import canonical_path, json_digest, load_json, validate_manifest
 from wag_protection.ledger import CURRENT_DISPATCH, _commit
 
 
@@ -169,6 +170,47 @@ def validate_engine_settings(engine_data):
     ):
         raise ProtectionError('capability_refused')
     return approved
+
+
+def validate_engine_source(engine_data, engine_dir, approved=None):
+    """Preflight a dynamic engine source before the loader executes it."""
+    store = get_store()
+    if isinstance(store, Refusal):
+        raise ProtectionError(store.reason)
+    if approved is None:
+        approved = validate_engine_settings(engine_data)
+    module = approved['module']
+    relative = f'searx/engines/{module}.py'
+    try:
+        expected = canonical_path(Path(store.manifest['module_root']) / relative)
+        actual = canonical_path(Path(engine_dir) / f'{module}.py')
+    except (OSError, ValueError) as error:
+        raise ProtectionError('provenance_error') from error
+    if actual != expected or not actual.is_file():
+        raise ProtectionError('provenance_error')
+    if hashlib.sha256(actual.read_bytes()).hexdigest() != store.manifest['files'].get(relative):
+        raise ProtectionError('provenance_error')
+    return expected
+
+
+def validate_loaded_engine_source(module, expected, approved, manifest):
+    """Recheck the module object after the dynamic loader returns."""
+    origin = getattr(module, '__file__', None)
+    spec_origin = getattr(getattr(module, '__spec__', None), 'origin', None)
+    try:
+        valid_origin = (
+            isinstance(origin, str)
+            and isinstance(spec_origin, str)
+            and canonical_path(origin) == expected
+            and canonical_path(spec_origin) == expected
+        )
+        digest_matches = hashlib.sha256(expected.read_bytes()).hexdigest() == manifest['files'].get(
+            f"searx/engines/{approved['module']}.py"
+        )
+    except (OSError, ValueError) as error:
+        raise ProtectionError('provenance_error') from error
+    if not valid_origin or not digest_matches:
+        raise ProtectionError('provenance_error')
 
 
 def _dispatch():
