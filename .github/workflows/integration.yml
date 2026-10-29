@@ -70,19 +70,29 @@ jobs:
           MOZ_DISABLE_CONTENT_SANDBOX: "1"
         run: |
           mkdir -p "$TMPDIR"
-          if unshare --user --map-user=0 --map-group=1000 --net -- true 2>/dev/null; then
-            unshare --user --map-user=0 --map-group=1000 --net -- \
-              local/py3/bin/python -m tests.unit.test_wag_protection --make ci.test
-          else
+          runner_uid="$(id -u)"
+          if sudo -n true 2>/dev/null; then
             sudo -n env \
+              "HOME=$HOME" \
               "TMPDIR=$TMPDIR" \
               "PYTHONDONTWRITEBYTECODE=$PYTHONDONTWRITEBYTECODE" \
               "WAG_EXPECTED_HEAD=$WAG_EXPECTED_HEAD" \
+              "WAG_RUNNER_UID=$runner_uid" \
               "MOZ_ALLOW_ROOT=$MOZ_ALLOW_ROOT" \
               "MOZ_DISABLE_CONTENT_SANDBOX=$MOZ_DISABLE_CONTENT_SANDBOX" \
               "PATH=$PATH" \
               unshare --net -- \
-              setpriv --reuid 0 --regid 1000 --clear-groups -- \
+              sh -c '
+                set -eu
+                ip link set lo up
+                local/py3/bin/python -m tests.unit.test_wag_protection --make test.unit
+                make V=1 test.yamllint test.black test.pyright_modified test.pylint test.rst test.shell test.shfmt test.pybabel
+                setpriv --reuid "$WAG_RUNNER_UID" --regid 1000 --clear-groups -- \
+                  make V=1 test.robot
+                git diff --exit-code HEAD
+              '
+          else
+            unshare --user --map-user=0 --map-group=1000 --net -- \
               local/py3/bin/python -m tests.unit.test_wag_protection --make ci.test
           fi
 
