@@ -58,6 +58,9 @@ jobs:
       - name: Setup venv
         run: make V=1 install
 
+      - name: Provision test tools before network isolation
+        run: make V=1 gecko.driver go.env.dev
+
       - name: Run tests
         env:
           TMPDIR: ${{ github.workspace }}/local/tmp

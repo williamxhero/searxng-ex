@@ -247,10 +247,8 @@ class OnlineProcessor(EngineProcessor):
             # An explicit challenge must not become a plain error or a
             # successful result merely because the HTTP status is 200.
             headers = response.headers
-            if (
-                headers.get('Server', '').lower().startswith('cloudflare')
-                and headers.get('cf-mitigated', '').strip().lower() == 'challenge'
-            ):
+            # cf-mitigated is authoritative even if a proxy hides Server.
+            if headers.get('cf-mitigated', '').strip().lower() == 'challenge':
                 raise EngineFailure('challenge_unknown') from None
 
         def classified(operation):

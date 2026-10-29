@@ -1,4 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
+# Match the repository test convention without renaming externally selected test IDs.
+# pylint: disable=missing-class-docstring,invalid-name
+# Lazy imports keep native settings/network side effects inside prepared fixtures.
+# pylint: disable=import-outside-toplevel
 """Real native transport/parser components, on explicit synthetic loopback state."""
 
 import asyncio
@@ -39,8 +43,17 @@ QUARK_RESULT = (
 ).encode()
 
 
-BING_RESULT = b'<ol id="b_results"><li class="b_algo"><h2><a href="https://bing-fixture.invalid/source">Bing synthetic</a></h2><p>Offline source</p></li></ol>'
-YANDEX_RESULT = b'<li class="serp-item"><h3 class="b-serp-item__title"><a class="b-serp-item__title-link" href="https://yandex-fixture.invalid/source"><span>Yandex synthetic</span></a></h3><div class="b-serp-item__content"><div class="b-serp-item__text">Offline source</div></div></li>'
+BING_RESULT = (
+    b'<ol id="b_results"><li class="b_algo"><h2>'
+    b'<a href="https://bing-fixture.invalid/source">Bing synthetic</a></h2>'
+    b'<p>Offline source</p></li></ol>'
+)
+YANDEX_RESULT = (
+    b'<li class="serp-item"><h3 class="b-serp-item__title">'
+    b'<a class="b-serp-item__title-link" href="https://yandex-fixture.invalid/source">'
+    b'<span>Yandex synthetic</span></a></h3><div class="b-serp-item__content">'
+    b'<div class="b-serp-item__text">Offline source</div></div></li>'
+)
 CHINASO_RESULT = json.dumps(
     {
         'data': {
@@ -84,6 +97,7 @@ class FixtureHandler(BaseHTTPRequestHandler):
     """Real HTTP GET and CONNECT framing for the counted loopback fixture."""
 
     server: CountedServer
+    close_connection: bool  # Initialized by BaseHTTPRequestHandler, also used for CONNECT.
     protocol_version = 'HTTP/1.1'
 
     def do_GET(self):
@@ -127,11 +141,15 @@ class FixtureHandler(BaseHTTPRequestHandler):
             upstream.close()
             self.close_connection = True
 
-    def log_message(self, format, *args):
+    # Preserve BaseHTTPRequestHandler's override contract, including its parameter name.
+    def log_message(self, format, *args):  # pylint: disable=redefined-builtin
         pass
 
 
-class ProtectedTransportTest(unittest.TestCase):
+# One loopback/socket-safety fixture serves all native transport contract tests.
+class ProtectedTransportTest(unittest.TestCase):  # pylint: disable=too-many-public-methods
+    tls_server: CountedServer
+
     def setUp(self):
         original_socket = socket.socket
         original_resolve = socket.getaddrinfo
@@ -185,7 +203,10 @@ class ProtectedTransportTest(unittest.TestCase):
         )
         settings.start()
         self.addCleanup(settings.stop)
-        self.parent = tempfile.TemporaryDirectory(dir=os.environ['TMPDIR'])
+        # addCleanup owns this directory even if the rest of setUp fails.
+        self.parent = tempfile.TemporaryDirectory(  # pylint: disable=consider-using-with
+            dir=os.environ['TMPDIR']
+        )
         self.addCleanup(self.parent.cleanup)
         self.root = Path(self.parent.name) / 'native-synthetic'
         import wag_protection
@@ -197,7 +218,7 @@ class ProtectedTransportTest(unittest.TestCase):
             clock=lambda: {
                 'wall': time.time(),
                 'mono': time.monotonic(),
-                'boot': Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+                'boot': Path('/proc/sys/kernel/random/boot_id').read_text(encoding='utf-8').strip(),
             },
         )
         self.manifest = fixture_manifest(self.root, registry())
@@ -303,10 +324,10 @@ class ProtectedTransportTest(unittest.TestCase):
             parse=engine.response,
         )
 
+    # Settings, artifact provenance and loopback trust must be prepared and restored as one fixture.
+    # pylint: disable-next=too-many-locals
     def native_search_fixture(self, *, include_yandex=False):
         from copy import deepcopy
-        import sqlite3
-        from flask import Flask
         from searx import settings
         import searx.search
         from searx.network import THREADLOCAL
@@ -368,7 +389,7 @@ class ProtectedTransportTest(unittest.TestCase):
             clock=lambda: {
                 'wall': time.time(),
                 'mono': time.monotonic(),
-                'boot': Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+                'boot': Path('/proc/sys/kernel/random/boot_id').read_text(encoding='utf-8').strip(),
             },
         )
         outgoing = deepcopy(settings['outgoing'])
@@ -638,7 +659,7 @@ class ProtectedTransportTest(unittest.TestCase):
         import sqlite3
         from flask import Flask
 
-        search, root, manifest = self.native_search_fixture()
+        search, root, _ = self.native_search_fixture()
         with Flask('protected-native-test').test_request_context('/search'):
             container = search.search()
         summary = search.outbound_protection
@@ -665,6 +686,8 @@ class ProtectedTransportTest(unittest.TestCase):
             self.assertLessEqual(finished, search.start_time + 3.0)
             self.assertEqual((connections, headers), (1, 1))
 
+    # Keep the blocked parser, second sender and post-unlock poison observations in one deadline scenario.
+    # pylint: disable-next=too-many-locals
     def test_search_deadline_keeps_late_parser_null_and_poisoned_after_unlock(self):
         import sqlite3
         import sys
@@ -1028,6 +1051,8 @@ print(json.dumps({'reason': getattr(result, 'reason', None), 'calls': calls}))
             with self.subTest(raw=raw):
                 self.assertTrue(apply_schema({'wag_protection': {'enabled': raw}}, SCHEMA['outgoing'], ['outgoing']))
 
+    # This one vertical matrix retains real native dispatch, reopened state and every zero-send assertion.
+    # pylint: disable-next=too-many-locals,too-many-statements
     def test_native_challenge_denial_matrix_persists_pause_before_second_sender(self):
         """AC-A4: real native classification must durably gate the next sender."""
         from searx import settings
@@ -1172,9 +1197,26 @@ print(json.dumps({'reason': getattr(result, 'reason', None), 'calls': calls}))
                 None,
             ),
         ]
+        # cf-mitigated is authoritative even when a proxy removes/replaces Server.
+        explicit_cases = [
+            case for case in cases
+            if case[0] in {
+                'cloudflare-unknown', 'cloudflare-200-unknown',
+                'cloudflare-200-empty', 'cloudflare-200-parser-error',
+            }
+        ]
+        for label, name, status, headers, body, outcome, floor in explicit_cases:
+            for server in (None, 'nginx'):
+                variant_headers = dict(headers)
+                variant_headers.pop('Server', None)
+                if server is not None:
+                    variant_headers['Server'] = server
+                cases.append(
+                    (f'{label}-server-{server or "missing"}', name, status, variant_headers, body, outcome, floor)
+                )
         hosts = {'quark': 'quark.sm.cn', 'yandex': 'yandex.com'}
         healthy = {'quark': QUARK_RESULT, 'yandex': YANDEX_RESULT}
-        boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+        boot = Path('/proc/sys/kernel/random/boot_id').read_text(encoding='utf-8').strip()
         for label, name, status, headers, body, outcome, floor in cases:
             with self.subTest(case=label):
                 # Each case gets independent, explicitly synthetic state; never
@@ -1183,9 +1225,9 @@ print(json.dumps({'reason': getattr(result, 'reason', None), 'calls': calls}))
                 now = {'wall': time.time(), 'mono': time.monotonic(), 'boot': boot}
                 # Control only the ledger's clock boundary. Asyncio, native TLS,
                 # sockets and engine request/response implementations stay real.
-                clock = SimpleNamespace(time=lambda: now['wall'], monotonic=lambda: now['mono'])
+                clock = SimpleNamespace(time=lambda now=now: now['wall'], monotonic=lambda now=now: now['mono'])
                 with patch('wag_protection.ledger.time', clock):
-                    self.api.initialize_fixture(root, registry=manifest['registry'], clock=lambda: dict(now))
+                    self.api.initialize_fixture(root, registry=manifest['registry'], clock=lambda now=now: dict(now))
                     case_manifest = fixture_manifest(root, manifest['registry'])
                     case_manifest['config_digest'] = manifest['config_digest']
                     manifest_path = Path(self.parent.name) / (label + '-artifact.json')
@@ -1194,7 +1236,7 @@ print(json.dumps({'reason': getattr(result, 'reason', None), 'calls': calls}))
                     with patch.dict(settings['outgoing'], {'wag_protection': config}):
                         processor = PROCESSORS[name]
 
-                        def dispatch():
+                        def dispatch(processor=processor, monotonic=clock.monotonic):
                             # A new validated handle for every attempt: the pause
                             # must survive reopen, not just native memory state.
                             store = get_store()
@@ -1202,7 +1244,7 @@ print(json.dumps({'reason': getattr(result, 'reason', None), 'calls': calls}))
                             params = processor.get_params(search.search_query, 'general')
                             self.assertIsNotNone(params)
                             return processor.search_protected(
-                                search.search_query.query, params, store, now['mono'], 3.0
+                                search.search_query.query, params, store, monotonic(), 3.0
                             )
 
                         # Independent matrix fixtures must not reuse a socket

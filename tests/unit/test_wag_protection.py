@@ -1,4 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
+# Match the repository test convention without renaming externally selected test IDs.
+# pylint: disable=missing-class-docstring,invalid-name
+# Lazy imports keep native settings/network side effects inside prepared fixtures.
+# pylint: disable=import-outside-toplevel
+# Keep the public-contract gate and its isolated child-process harness in one test module.
+# pylint: disable=too-many-lines
 """Offline public-contract tests; no SearXNG imports or production state."""
 
 import hashlib
@@ -90,7 +96,8 @@ class ForkCleanupTest(unittest.TestCase):
                     os.close(write_fd)
                     if stalled:
                         os.read(read_fd, 1)
-                    os._exit(0)
+                    # A fork child must terminate without running inherited Python cleanups.
+                    os._exit(0)  # pylint: disable=protected-access
                 os.close(read_fd)
                 try:
                     pid, status = _reap_owned_fork(child)
@@ -199,16 +206,20 @@ def fixture_manifest(root, engines):
     return manifest
 
 
-class StoreTest(unittest.TestCase):
+# One fixture owns these related migration, recovery and admission contract tests.
+class StoreTest(unittest.TestCase):  # pylint: disable=too-many-public-methods
     def setUp(self):
         import wag_protection
 
         self.api = wag_protection
-        self.parent = tempfile.TemporaryDirectory(dir=os.environ['TMPDIR'])
+        # addCleanup owns this directory even if the rest of setUp fails.
+        self.parent = tempfile.TemporaryDirectory(  # pylint: disable=consider-using-with
+            dir=os.environ['TMPDIR']
+        )
         self.addCleanup(self.parent.cleanup)
         self.root = Path(self.parent.name) / 'synthetic-state'
         self.engines = registry()
-        self.boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+        self.boot = Path('/proc/sys/kernel/random/boot_id').read_text(encoding='utf-8').strip()
         self.now: FixtureClock = {'wall': 10000.0, 'mono': 100.0, 'boot': self.boot}
         self.wall = patch('time.time', side_effect=lambda: self.now['wall'])
         self.mono = patch('time.monotonic', side_effect=lambda: self.now['mono'])
@@ -280,7 +291,7 @@ class StoreTest(unittest.TestCase):
             self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0], 2)
             self.assertEqual(
                 db.execute(
-                    'SELECT registry_digest,migration_wall,migration_mono,migration_boot ' 'FROM contract_meta'
+                    'SELECT registry_digest,migration_wall,migration_mono,migration_boot FROM contract_meta'
                 ).fetchone(),
                 (manifest['registry_digest'], 10001.0, 8073001.0, self.boot),
             )
@@ -405,7 +416,7 @@ class StoreTest(unittest.TestCase):
                     'bing',
                     caller='probe',
                     deadline_mono=self.now['mono'] + 3,
-                    build=lambda: calls.append('build'),
+                    build=lambda calls=calls: calls.append('build'),
                     send=lambda context, request: None,
                     parse=lambda response: [],
                 )
@@ -429,7 +440,7 @@ class StoreTest(unittest.TestCase):
             'bing',
             caller='probe',
             deadline_mono=self.now['mono'] + 3,
-            build=lambda: calls.append('build'),
+            build=lambda calls=calls: calls.append('build'),
             send=lambda context, request: None,
             parse=lambda response: [],
         )
@@ -542,7 +553,8 @@ print('locked', flush=True)
 os.read(0, 1)
 os.close(fd)
 '''
-        process = subprocess.Popen(
+        # The finally block explicitly terminates/reaps this fault-injection child and its pipes.
+        process = subprocess.Popen(  # pylint: disable=consider-using-with
             [sys.executable, '-S', '-c', script, str(root / 'lock')],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -620,7 +632,8 @@ print(json.dumps({'reason': getattr(result, 'reason', None)}), flush=True)
                 )
                 token = (root / 'identity').read_bytes()
                 inode = (root / 'lock').stat().st_ino
-                process = subprocess.Popen(
+                # The finally block explicitly terminates/reaps this fault-injection child and its pipes.
+                process = subprocess.Popen(  # pylint: disable=consider-using-with
                     [sys.executable, '-S', '-c', script, str(root), json.dumps(manifest), stage],
                     cwd=WORKSPACE,
                     stdin=subprocess.PIPE,
@@ -739,7 +752,7 @@ print(json.dumps({'reason': getattr(result, 'reason', None)}), flush=True)
         with sqlite3.connect(self.root / 'ledger.sqlite') as db:
             self.assertEqual(
                 db.execute(
-                    'SELECT authorization,old_checkpoint,old_poison_json,new_boot,wall,mono,decision ' 'FROM recoveries'
+                    'SELECT authorization,old_checkpoint,old_poison_json,new_boot,wall,mono,decision FROM recoveries'
                 ).fetchall(),
                 [
                     (
@@ -800,6 +813,8 @@ print(json.dumps({'reason': getattr(result, 'reason', None)}), flush=True)
         self.assertEqual(result.reason, 'evidence_unknown')
         self.assertEqual((self.root / 'ledger.sqlite').read_bytes(), before)
 
+    # Keep sender coverage, lock ownership and post-refusal assertions in one recovery scenario.
+    # pylint: disable-next=too-many-statements
     def test_recovery_rejects_missing_coverage_and_preserves_live_sender(self):
         import select
         from wag_protection.ledger import _SyntheticMaintenanceSession
@@ -856,10 +871,14 @@ print(json.dumps({'reason': getattr(result, 'reason', None)}), flush=True)
                     with sqlite3.connect(root / 'ledger.sqlite') as db:
                         # A valid NULL row from another dispatch is not covered by this sender's birth registration.
                         unregistered_id = db.execute(
-                            'INSERT INTO attempts (dispatch_id,engine,domestic,stamp,outcome,reserved_mono,finished_mono,'
-                            'account_boot,account_mono,caller,phase,connection_attempted,http_attempted,elapsed,source) '
-                            'SELECT ?,engine,domestic,stamp,outcome,reserved_mono,finished_mono,account_boot,account_mono,'
-                            'caller,phase,connection_attempted,http_attempted,elapsed,source FROM attempts WHERE attempt_id=?',
+                            'INSERT INTO attempts (dispatch_id,engine,domestic,stamp,outcome,'
+                            'reserved_mono,finished_mono,'
+                            'account_boot,account_mono,caller,phase,connection_attempted,'
+                            'http_attempted,elapsed,source) '
+                            'SELECT ?,engine,domestic,stamp,outcome,reserved_mono,finished_mono,'
+                            'account_boot,account_mono,'
+                            'caller,phase,connection_attempted,http_attempted,elapsed,source '
+                            'FROM attempts WHERE attempt_id=?',
                             ('stage10-unregistered-dispatch', binding.attempt_ids[0]),
                         ).lastrowid
                     self.assertNotIn(unregistered_id, binding.attempt_ids)
@@ -934,6 +953,8 @@ print(json.dumps({'reason': getattr(result, 'reason', None)}), flush=True)
         store.claim_release('4' * 32, manifest['artifact_digest'], manifest['config_digest'], 110.0)
         return root, manifest
 
+    # Each SQL mutation boundary is checked against the same complete before/after audit fixture.
+    # pylint: disable-next=too-many-locals
     def test_recovery_real_sqlite_faults_rollback_audits_and_mid_mutation(self):
         from wag_protection.ledger import _SyntheticMaintenanceSession
 
@@ -988,13 +1009,20 @@ print(json.dumps({'reason': getattr(result, 'reason', None)}), flush=True)
                     before = (root / 'ledger.sqlite').read_bytes()
                     reached = []
 
-                    def connect(database, *args, **kwargs):
+                    def connect(
+                        database,
+                        *args,
+                        root=root,
+                        fault=(action, table, column),
+                        record_failure=reached.append,
+                        **kwargs,
+                    ):
                         db = original_connect(database, *args, **kwargs)
                         if str(database).startswith('file:' + str(root / 'ledger.sqlite')):
 
-                            def authorize(operation, name, field, *unused):
-                                if (operation, name, field) == (action, table, column):
-                                    reached.append(
+                            def authorize(operation, name, field, *_unused):
+                                if (operation, name, field) == fault:
+                                    record_failure(
                                         {
                                             'counts': tuple(
                                                 db.execute(f'SELECT count(*) FROM {audit}').fetchone()[0]
@@ -1004,7 +1032,8 @@ print(json.dumps({'reason': getattr(result, 'reason', None)}), flush=True)
                                                 'SELECT old_row_json FROM recovery_attempts ORDER BY attempt_id'
                                             ).fetchall(),
                                             'pauses': db.execute(
-                                                'SELECT engine,old_strikes,old_until FROM recovery_pauses ORDER BY engine'
+                                                'SELECT engine,old_strikes,old_until '
+                                                'FROM recovery_pauses ORDER BY engine'
                                             ).fetchall(),
                                             'attempts': [
                                                 dict(row)
@@ -1053,6 +1082,8 @@ print(json.dumps({'reason': getattr(result, 'reason', None)}), flush=True)
                         isinstance(self.api.open_store(root, manifest=manifest, mode='synthetic'), self.api.Refusal)
                     )
 
+    # The child death, hot-journal reopen and complete audit assertions form one atomicity check.
+    # pylint: disable-next=too-many-statements
     def test_recovery_real_commit_death_keeps_old_or_complete_new_state(self):
         import select
 
@@ -1114,7 +1145,8 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
                 root, manifest = self.recovery_fixture(f'recovery-commit-death-{stage}')
                 identity = (root / 'identity').read_bytes()
                 lock_inode = (root / 'lock').stat().st_ino
-                process = subprocess.Popen(
+                # The finally block explicitly terminates/reaps this fault-injection child and its pipes.
+                process = subprocess.Popen(  # pylint: disable=consider-using-with
                     [sys.executable, '-S', '-c', script, str(root), json.dumps(manifest), stage],
                     cwd=WORKSPACE,
                     stdin=subprocess.PIPE,
@@ -1247,8 +1279,8 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
             before = (root / 'ledger.sqlite').read_bytes()
             observed = []
 
-            def fail_directory_fsync(fd):
-                self.assertEqual(os.fstat(fd).st_ino, root.stat().st_ino)
+            def fail_directory_fsync(descriptor):
+                self.assertEqual(os.fstat(descriptor).st_ino, root.stat().st_ino)
                 with sqlite3.connect(root / 'ledger.sqlite') as db:
                     observed.append(db.execute('SELECT count(*) FROM recoveries').fetchone()[0])
                     self.assertEqual(
@@ -1292,6 +1324,8 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
                 isinstance(self.api.open_store(root, manifest=manifest, mode='synthetic'), self.api.Refusal)
             )
 
+    # Keep ownership and counterfeit-proof checks attached to their original live maintenance session.
+    # pylint: disable-next=too-many-locals,too-many-statements
     def test_recovery_owner_thread_fork_and_counterfeit_proofs_refuse_without_callbacks(self):
         import pickle
         import select
@@ -1326,7 +1360,8 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
                 result = self.api.recover(root, authorization=authorization, decision='combined', proof=proof)
                 assert isinstance(result, self.api.Refusal)
                 os.write(write_fd, result.reason.encode('ascii'))
-                os._exit(0)
+                # A fork child must terminate without running inherited Python cleanups.
+                os._exit(0)  # pylint: disable=protected-access
             os.close(write_fd)
             try:
                 self.assertTrue(select.select([read_fd], [], [], 5)[0], 'forked proof owner did not refuse')
@@ -1343,18 +1378,22 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
 
             called = []
 
-            class Counterfeit(self.api.RecoveryProofV1):
+            # A single interception hook is the adversarial proof input.
+            class Counterfeit(self.api.RecoveryProofV1):  # pylint: disable=too-few-public-methods
                 def __getattribute__(self, name):
                     called.append(name)
                     raise AssertionError('proof subclass callback executed')
 
-            class Callback:
+            # Only attribute interception is needed to detect an unauthorized callback.
+            class Callback:  # pylint: disable=too-few-public-methods
                 def __getattribute__(self, name):
                     called.append(name)
                     raise AssertionError('untyped proof callback executed')
 
             copied = self.api.RecoveryProofV1(
-                proof.version, proof.capability, proof.approved_manifest, proof.sender_bindings, proof._witness
+                proof.version, proof.capability, proof.approved_manifest, proof.sender_bindings,
+                # Deliberately copy the private witness to prove a counterfeit remains rejected.
+                proof._witness,  # pylint: disable=protected-access
             )
             for value in (copied, object.__new__(Counterfeit), Callback(), b'serialized-proof', True, {}):
                 result = self.api.recover(root, authorization=authorization, decision='combined', proof=value)
@@ -1481,7 +1520,10 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
             assert isinstance(approved['registry'][0], Mapping)
             assert isinstance(approved['registry'][0]['profile'], Mapping)
             with self.assertRaises(TypeError):
-                exec("approved['registry'][0]['profile']['live_hold'] = True", {}, {'approved': approved})
+                # Exercise runtime assignment to the read-only Mapping without a misleading mutable cast.
+                exec(  # pylint: disable=exec-used
+                    "approved['registry'][0]['profile']['live_hold'] = True", {}, {'approved': approved}
+                )
             assert isinstance(manifest['registry'], list)
             assert isinstance(manifest['registry'][0], dict)
             assert isinstance(manifest['registry'][0]['profile'], dict)
@@ -1498,6 +1540,8 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
             result = self.api.recover(root, authorization=authorization, decision='combined', proof=proof)
             self.assertIs(type(result), self.api.RecoveryResult)
 
+    # The decision matrix needs both original audit state and recovery results for each row.
+    # pylint: disable-next=too-many-locals
     def test_recovery_decisions_enforce_null_and_clock_requirements(self):
         from wag_protection.ledger import _SyntheticMaintenanceSession
 
@@ -1676,9 +1720,9 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
                     'bing',
                     caller='probe',
                     deadline_mono=103.0,
-                    build=lambda: calls.append('build'),
-                    send=lambda context, request: calls.append('send'),
-                    parse=lambda response: calls.append('parse') or [],
+                    build=lambda calls=calls: calls.append('build'),
+                    send=lambda context, request, calls=calls: calls.append('send'),
+                    parse=lambda response, calls=calls: calls.append('parse') or [],
                 )
                 self.assertEqual(
                     (getattr(reopened, 'reason', None), getattr(outcome, 'reason', None), calls),
@@ -1920,9 +1964,9 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
                     'bing',
                     caller='probe',
                     deadline_mono=103.0,
-                    build=lambda: calls.append('build'),
-                    send=lambda context, request: calls.append('send'),
-                    parse=lambda response: calls.append('parse') or [],
+                    build=lambda calls=calls: calls.append('build'),
+                    send=lambda context, request, calls=calls: calls.append('send'),
+                    parse=lambda response, calls=calls: calls.append('parse') or [],
                 )
                 self.assertEqual(getattr(result, 'reason', None), 'clock_error')
                 self.assertEqual(calls, [])
@@ -2071,7 +2115,8 @@ def build():
 store.run_engine('bing', caller='probe', deadline_mono=103.0,
                  build=build, send=lambda context, request: None, parse=lambda response: [])
 '''
-        process = subprocess.Popen(
+        # The finally block explicitly terminates/reaps this fault-injection child and its pipes.
+        process = subprocess.Popen(  # pylint: disable=consider-using-with
             [sys.executable, '-S', '-c', script, str(self.root), json.dumps(self.manifest)],
             cwd=WORKSPACE,
             stdin=subprocess.PIPE,
@@ -2275,16 +2320,17 @@ def _install_offline_test_guard():
             return Path(address).resolve().is_relative_to(Path(os.environ['TMPDIR']).resolve())
         return isinstance(address, tuple) and loopback(address[0])
 
+    # Inference cannot follow this captured real socket type after the constructor is patched.
     class LoopbackSocket(original_socket):
         def connect(self, address):
             if not permitted(address, self.family):
                 raise AssertionError('offline test denied nonloopback connect')
-            return super().connect(address)
+            return super().connect(address)  # pylint: disable=no-member
 
         def connect_ex(self, address):
             if not permitted(address, self.family):
                 raise AssertionError('offline test denied nonloopback connect')
-            return super().connect_ex(address)
+            return super().connect_ex(address)  # pylint: disable=no-member
 
     def resolve(host, *args, **kwargs):
         if not loopback(host):
@@ -2310,7 +2356,8 @@ def _install_offline_test_guard():
             self.end_headers()
             self.wfile.write(body)
 
-        def log_message(self, format, *args):
+        # Preserve BaseHTTPRequestHandler's override contract, including its parameter name.
+        def log_message(self, format, *args):  # pylint: disable=redefined-builtin
             pass
 
     server = ThreadingHTTPServer(('127.0.0.1', 0), RulesHandler)
@@ -2406,7 +2453,10 @@ def _offline_test_main(arguments):
         flush=True,
     )
 
-    positive = 'tests.unit.network.test_protected.ProtectedTransportTest.test_native_search_two_engines_same_query_complete_nonempty'
+    positive = (
+        'tests.unit.network.test_protected.ProtectedTransportTest.'
+        'test_native_search_two_engines_same_query_complete_nonempty'
+    )
 
     class OfflineResult(unittest.TextTestResult):
         native_headers = 0
@@ -2428,7 +2478,8 @@ def _offline_test_main(arguments):
     suite = unittest.defaultTestLoader.loadTestsFromNames(names)
     result = unittest.TextTestRunner(verbosity=2, resultclass=OfflineResult).run(suite)
     print(
-        f'offline_tests={result.testsRun} native_positive_headers={result.native_headers} unexpected_skips={len(result.skipped)}',
+        f'offline_tests={result.testsRun} native_positive_headers={result.native_headers} '
+        f'unexpected_skips={len(result.skipped)}',
         flush=True,
     )
     return (
