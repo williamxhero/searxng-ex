@@ -72,7 +72,10 @@ jobs:
             unshare --user --map-user=0 --map-group=1000 --net -- \
               local/py3/bin/python -m tests.unit.test_wag_protection --make ci.test
           else
-            sudo -n --preserve-env=TMPDIR,PYTHONDONTWRITEBYTECODE,WAG_EXPECTED_HEAD \
+            sudo -n env \
+              "TMPDIR=$TMPDIR" \
+              "PYTHONDONTWRITEBYTECODE=$PYTHONDONTWRITEBYTECODE" \
+              "WAG_EXPECTED_HEAD=$WAG_EXPECTED_HEAD" \
               unshare --net -- \
               local/py3/bin/python -m tests.unit.test_wag_protection --make ci.test
           fi
@@ -111,7 +114,10 @@ jobs:
               local/protection-venv/bin/python -m tests.unit.test_wag_protection --offline \
               2>&1 | tee local/protection-offline.log
           else
-            sudo -n --preserve-env=TMPDIR,PYTHONDONTWRITEBYTECODE,WAG_EXPECTED_HEAD \
+            sudo -n env \
+              "TMPDIR=$TMPDIR" \
+              "PYTHONDONTWRITEBYTECODE=$PYTHONDONTWRITEBYTECODE" \
+              "WAG_EXPECTED_HEAD=$WAG_EXPECTED_HEAD" \
               unshare --net -- \
               local/protection-venv/bin/python -m tests.unit.test_wag_protection --offline \
               2>&1 | tee local/protection-offline.log
