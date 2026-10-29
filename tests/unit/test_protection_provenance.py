@@ -213,10 +213,8 @@ class DependencyProvenanceTest(TestCase):  # pylint: disable=too-many-public-met
         with self.assertRaises(ValueError):
             self._validate(self._seal(manifest))
 
-    def _console_manifest(self):
-        self.payload[DIST_INFO + "/entry_points.txt"] = (
-            b"[console_scripts]\nfixture-cli = wag_provenance_fixture:main\n"
-        )
+    def _console_manifest(self, entry_points=b"[console_scripts]\nfixture-cli = wag_provenance_fixture:main\n"):
+        self.payload[DIST_INFO + "/entry_points.txt"] = entry_points
         self._write_wheel()
         self._write_installed()
         self.scripts.mkdir()
@@ -245,6 +243,21 @@ class DependencyProvenanceTest(TestCase):  # pylint: disable=too-many-public-met
         manifest = self._console_manifest()
         with patch.object(sysconfig, "get_path", return_value=str(self.scripts)):
             self.assertEqual(self._validate(manifest), manifest)
+
+    def test_production_accepts_console_launcher_with_empty_defaults(self):
+        manifest = self._console_manifest(
+            b"[DEFAULT]\n\n[console_scripts]\nfixture-cli = wag_provenance_fixture:main\n"
+        )
+        with patch.object(sysconfig, "get_path", return_value=str(self.scripts)):
+            self.assertEqual(self._validate(manifest), manifest)
+
+    def test_production_rejects_console_launcher_inherited_from_defaults(self):
+        manifest = self._console_manifest(
+            b"[DEFAULT]\nfixture-cli = wag_provenance_fixture:main\n\n[console_scripts]\n"
+        )
+        with patch.object(sysconfig, "get_path", return_value=str(self.scripts)):
+            with self.assertRaisesRegex(ValueError, "wheel entry points defaults"):
+                self._validate(manifest)
 
     def test_production_rejects_modified_console_launcher_body_or_interpreter(self):
         manifest = self._console_manifest()

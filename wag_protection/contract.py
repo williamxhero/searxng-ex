@@ -404,6 +404,8 @@ def _wheel_console_launchers(wheel_payload, distribution):
         parser.read_string(wheel_payload[entry_name][2].decode('utf-8'))
     except (UnicodeError, configparser.Error) as error:
         raise ValueError('invalid wheel entry points') from error
+    if parser.defaults():
+        raise ValueError('unsupported wheel entry points defaults')
     if not parser.has_section('console_scripts'):
         return {}
     declarations = dict(parser.items('console_scripts', raw=True))
