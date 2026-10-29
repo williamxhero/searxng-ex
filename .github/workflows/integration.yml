@@ -70,12 +70,14 @@ jobs:
           MOZ_DISABLE_CONTENT_SANDBOX: "1"
         run: |
           mkdir -p "$TMPDIR"
+          runner_uid="$(id -u)"
           if sudo -n true 2>/dev/null; then
             sudo -n env \
               "HOME=$HOME" \
               "TMPDIR=$TMPDIR" \
               "PYTHONDONTWRITEBYTECODE=$PYTHONDONTWRITEBYTECODE" \
               "WAG_EXPECTED_HEAD=$WAG_EXPECTED_HEAD" \
+              "WAG_RUNNER_UID=$runner_uid" \
               "MOZ_ALLOW_ROOT=$MOZ_ALLOW_ROOT" \
               "MOZ_DISABLE_CONTENT_SANDBOX=$MOZ_DISABLE_CONTENT_SANDBOX" \
               "PATH=$PATH" \
@@ -90,7 +92,22 @@ jobs:
                     test.yamllint test.black test.pyright_modified \
                     test.pylint test.rst test.shell test.shfmt test.pybabel
                 setpriv --reuid 0 --regid 1000 --clear-groups -- \
-                  make V=1 test.robot
+                  env SEARXNG_SETTINGS_PATH="$PWD/tests/robot/settings_robot.yml" \
+                  local/py3/bin/python searx/webapp.py > "$TMPDIR/robot-server.log" 2>&1 &
+                server_pid=$!
+                trap "kill $server_pid 2>/dev/null || true; wait $server_pid 2>/dev/null || true" EXIT
+                for _ in $(seq 1 50); do
+                  if curl --fail --silent http://127.0.0.1:11111/ >/dev/null; then
+                    break
+                  fi
+                  sleep 0.1
+                done
+                if ! curl --fail --silent http://127.0.0.1:11111/ >/dev/null; then
+                  cat "$TMPDIR/robot-server.log"
+                  exit 1
+                fi
+                setpriv --reuid "$WAG_RUNNER_UID" --regid 1000 --clear-groups -- \
+                  env SEARXNG_ROBOT_EXTERNAL_SERVER=1 make V=1 test.robot
                 git diff --exit-code HEAD
               '
           else
