@@ -417,11 +417,23 @@ def int_or_zero(num: list[str] | str) -> int:
     return convert_str_to_int(num)
 
 
+class _SourceOnlyLoader(importlib.machinery.SourceFileLoader):
+    """Force source-only loading by refusing bytecode cache metadata."""
+
+    def path_stats(self, path):
+        # Only block bytecode cache; allow source stats
+        if str(path).endswith((".pyc", ".pyo")):
+            raise OSError("bytecode cache disabled for provenance enforcement")
+        return super().path_stats(path)
+
+
 def load_module(filename: str, module_dir: str) -> types.ModuleType:
     modname = splitext(filename)[0]
     modpath = join(module_dir, filename)
     # and https://docs.python.org/3/library/importlib.html#importing-a-source-file-directly
-    spec = importlib.util.spec_from_file_location(modname, modpath)
+    # Disable bytecode cache to enforce source-only provenance
+    loader = _SourceOnlyLoader(modname, modpath)
+    spec = importlib.util.spec_from_file_location(modname, modpath, loader=loader)
     if not spec:
         raise ValueError(f"Error loading '{modpath}' module")
     module = importlib.util.module_from_spec(spec)
