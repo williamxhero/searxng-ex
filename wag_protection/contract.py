@@ -402,8 +402,11 @@ def _installed_payload(distribution):
             raise ValueError('invalid installed record')
         name, digest, size = row
         relative = _safe_dependency_path(name)
-        path = canonical_path(root / relative)
-        if root not in path.parents or path.is_symlink() or not path.is_file():
+        raw_path = root / relative
+        if raw_path.is_symlink() or not raw_path.is_file():
+            raise ValueError('invalid installed payload')
+        path = canonical_path(raw_path)
+        if root not in path.parents or not path.is_file():
             raise ValueError('invalid installed payload')
         contents = path.read_bytes()
         if digest and hashlib.sha256(contents).hexdigest() != _record_digest(digest):
@@ -419,12 +422,14 @@ def _validate_wheel_metadata(wheel_name, wheel_payload, distribution, version):
     if len(metadata_names) != 1:
         raise ValueError('invalid wheel metadata')
     metadata = email.message_from_bytes(wheel_payload[metadata_names[0]][2])
-    if (_normalise_distribution_name(metadata.get('Name', '')) != distribution
-            or metadata.get('Version') != version):
+    metadata_name = metadata.get('Name') or ''
+    metadata_version = metadata.get('Version') or ''
+    if (_normalise_distribution_name(metadata_name) != distribution
+            or metadata_version != version):
         raise ValueError('wheel metadata mismatch')
     if not any(name.endswith('.dist-info/RECORD') for name in wheel_payload):
         raise ValueError('missing wheel record')
-    if _normalise_distribution_name(metadata.get('Name', '')) != _wheel_identity(wheel_name)[0]:
+    if _normalise_distribution_name(metadata_name) != _wheel_identity(wheel_name)[0]:
         raise ValueError('wheel metadata mismatch')
 
 
