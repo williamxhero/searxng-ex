@@ -172,14 +172,29 @@ def _secure(path, manifest, directory=False):
     return info
 
 
-def _commit(db, root):
-    db.commit()
+def _fsync_root(root):
     # SQLite FULL protects the journal transaction; also persist directory entries.
     fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def _commit(db, root):
+    db.commit()
+    try:
+        _fsync_root(root)
+    except OSError:
+        # The SQLite commit may already be visible even when the directory fsync
+        # fails.  Persist a fail-closed poison before surfacing the storage error.
+        try:
+            db.execute('INSERT INTO poison VALUES (?)', ('storage_error',))
+            db.commit()
+            _fsync_root(root)
+        except (OSError, sqlite3.Error):
+            db.rollback()
+        raise
 
 
 def _schema_signature(db, table_names=TABLES):
@@ -562,11 +577,10 @@ class Store:
             outcome = error.outcome
             suspension_s = error.suspension_s
         except ProtectionError as error:
-            outcome = {'deadline_exceeded': 'timeout', 'capability_refused': 'runtime_error'}.get(
-                error.reason, error.reason
-            )
-            if outcome not in OUTCOMES:
-                outcome = 'error'
+            if error.reason not in ('deadline_exceeded', 'capability_refused'):
+                context.finish_unfinished()
+                raise
+            outcome = {'deadline_exceeded': 'timeout', 'capability_refused': 'runtime_error'}[error.reason]
         except Exception:  # callbacks may contain private request/response data
             pass
         return outcome, results, result_count, suspension_s

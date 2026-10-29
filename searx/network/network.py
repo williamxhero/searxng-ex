@@ -60,6 +60,9 @@ class Network:
         '_local_addresses_cycle',
         '_proxies_cycle',
         '_clients',
+        '_active_requests',
+        '_drain_event',
+        '_draining',
         '_logger',
         'protected',
     )
@@ -101,6 +104,10 @@ class Network:
         self._local_addresses_cycle = self.get_ipaddress_cycle()
         self._proxies_cycle = self.get_proxy_cycles()
         self._clients = {}
+        self._active_requests = 0
+        self._drain_event = asyncio.Event()
+        self._drain_event.set()
+        self._draining = False
         self._logger = logger.getChild(logger_name) if logger_name else logger
         self.check_parameters()
 
@@ -198,6 +205,8 @@ class Network:
         return result
 
     async def get_client(self, verify: bool | None = None, max_redirects: int | None = None) -> httpx.AsyncClient:
+        if self._draining:
+            raise RuntimeError('network generation is draining')
         if self.protected and self.using_tor_proxy:
             from wag_protection import ProtectionError  # pylint: disable=import-outside-toplevel
 
@@ -241,13 +250,20 @@ class Network:
         return self._clients[key]
 
     async def aclose(self):
-        async def close_client(client):
-            try:
-                await client.aclose()
-            except httpx.HTTPError:
-                pass
+        self._draining = True
+        try:
+            await self._drain_event.wait()
 
-        await asyncio.gather(*[close_client(client) for client in self._clients.values()], return_exceptions=False)
+            async def close_client(client):
+                try:
+                    await client.aclose()
+                except httpx.HTTPError:
+                    pass
+
+            await asyncio.gather(*[close_client(client) for client in self._clients.values()], return_exceptions=False)
+        except BaseException:
+            self._draining = False
+            raise
         self._clients.clear()
 
     @staticmethod
@@ -320,6 +336,18 @@ class Network:
         return response
 
     async def call_client(self, stream: bool, method: str, url: str, **kwargs: t.Any) -> SXNG_Response:
+        if self._draining:
+            raise RuntimeError('network generation is draining')
+        self._active_requests += 1
+        self._drain_event.clear()
+        try:
+            return await self._call_client(stream, method, url, **kwargs)
+        finally:
+            self._active_requests -= 1
+            if self._active_requests == 0:
+                self._drain_event.set()
+
+    async def _call_client(self, stream: bool, method: str, url: str, **kwargs: t.Any) -> SXNG_Response:
         if self.protected:
             return await self._call_protected_client(stream, method, url, **kwargs)
         retries = self.retries
@@ -359,8 +387,9 @@ class Network:
         return await self.call_client(True, method, url, **kwargs)
 
     @classmethod
-    async def aclose_all(cls):
-        await asyncio.gather(*[network.aclose() for network in NETWORKS.values()], return_exceptions=False)
+    async def aclose_all(cls, networks=None):
+        networks = list(dict.fromkeys(NETWORKS.values() if networks is None else networks))
+        await asyncio.gather(*[network.aclose() for network in networks], return_exceptions=False)
 
 
 def get_network(name: str | None = None) -> "Network":
@@ -474,9 +503,25 @@ def initialize(
 
     # Build and validate the complete replacement before stopping the active
     # generation. A malformed reload must leave the running generation alive.
-    if NETWORKS:
-        done()
+    old_networks = list(dict.fromkeys(NETWORKS.values()))
+    if old_networks:
+        _close_network_generation(old_networks)
+        NETWORKS.clear()
     NETWORKS.update(new_networks)
+
+
+def _close_network_generation(networks):
+    loop = get_loop()
+    if loop:
+        future = asyncio.run_coroutine_threadsafe(Network.aclose_all(networks), loop)
+        try:
+            # wait 3 seconds to close the HTTP clients
+            future.result(3)
+        except BaseException:
+            future.cancel()
+            raise
+    else:
+        asyncio.run(Network.aclose_all(networks))
 
 
 @atexit.register
@@ -489,12 +534,9 @@ def done():
     Note: since Network.aclose has to be async, it is not possible to call this method on Network.__del__
     So Network.aclose is called here using atexit.register
     """
+    networks = list(dict.fromkeys(NETWORKS.values()))
     try:
-        loop = get_loop()
-        if loop:
-            future = asyncio.run_coroutine_threadsafe(Network.aclose_all(), loop)
-            # wait 3 seconds to close the HTTP clients
-            future.result(3)
+        _close_network_generation(networks)
     finally:
         NETWORKS.clear()
 

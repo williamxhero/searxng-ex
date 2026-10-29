@@ -21,6 +21,15 @@ class TestNetwork(SearxTestCase):
         self.assertEqual(next(network._local_addresses_cycle), None)
         self.assertEqual(next(network._proxies_cycle), ())
 
+    def test_initialize_keeps_active_networks_when_generation_close_fails(self):
+        old_default = NETWORKS['__DEFAULT__']
+        with patch.object(Network, 'aclose', side_effect=RuntimeError('synthetic close fault')):
+            with self.assertRaises(RuntimeError):
+                initialize(
+                    settings_engines=list(settings['engines']), settings_outgoing=copy.deepcopy(settings['outgoing'])
+                )
+        self.assertIs(NETWORKS['__DEFAULT__'], old_default)
+
     def test_initialize_keeps_active_networks_when_candidate_validation_fails(self):
         old_default = NETWORKS['__DEFAULT__']
         outgoing = copy.deepcopy(settings['outgoing'])
@@ -30,6 +39,34 @@ class TestNetwork(SearxTestCase):
             initialize(settings_engines=list(settings['engines']), settings_outgoing=outgoing)
 
         self.assertIs(NETWORKS['__DEFAULT__'], old_default)
+
+    async def test_aclose_waits_for_inflight_request_before_closing_generation(self):
+        import asyncio
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def request(*args, **kwargs):  # pylint: disable=unused-argument
+            started.set()
+            await release.wait()
+            return httpx.Response(200)
+
+        network = Network(enable_http=True)
+        with patch.object(httpx.AsyncClient, 'request', new=request):
+            request_task = asyncio.create_task(network.request('GET', 'https://example.com/'))
+            await started.wait()
+            client = next(iter(network._clients.values()))
+            close_task = asyncio.create_task(network.aclose())
+            await asyncio.sleep(0)
+            self.assertFalse(client.is_closed)
+            release.set()
+            await request_task
+            await close_task
+
+        self.assertTrue(client.is_closed)
+        self.assertEqual(network._clients, {})
+        with self.assertRaises(RuntimeError):
+            await network.get_client()
 
     async def test_aclose_clears_client_pool(self):
         network = Network()

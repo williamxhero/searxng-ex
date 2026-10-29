@@ -1263,6 +1263,41 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
                         process.kill()
                     process.communicate(timeout=5)
 
+    def test_engine_commit_fsync_failure_poisons_ledger_before_refusing(self):
+        with patch('os.fsync', side_effect=[OSError('synthetic fsync fault'), None]):
+            result = self.attempt(parse=lambda response: [])
+        assert isinstance(result, self.api.Refusal)
+        self.assertEqual(result.reason, 'storage_error')
+        with sqlite3.connect(self.root / 'ledger.sqlite') as db:
+            self.assertEqual(db.execute('SELECT reason FROM poison').fetchall(), [('storage_error',)])
+        reopened = self.open()
+        assert not isinstance(reopened, self.api.Refusal)
+        refused = reopened.run_engine(
+            'bing',
+            caller='native_search',
+            deadline_mono=self.now['mono'] + 3,
+            build=lambda: self.fail('poisoned ledger invoked callback'),
+            send=lambda context, request: None,
+            parse=lambda response: [],
+        )
+        assert isinstance(refused, self.api.Refusal)
+        self.assertEqual(refused.reason, 'storage_error')
+
+    def test_fatal_protection_error_marks_attempt_unfinished_before_refusing(self):
+        from wag_protection.contract import ProtectionError
+
+        def fail_build():
+            raise ProtectionError('provenance_error')
+
+        result = self.attempt(build=fail_build)
+        assert isinstance(result, self.api.Refusal)
+        self.assertEqual(result.reason, 'provenance_error')
+        with sqlite3.connect(self.root / 'ledger.sqlite') as db:
+            self.assertEqual(db.execute('SELECT reason FROM poison').fetchall(), [('unfinished_attempt',)])
+        refused = self.attempt(build=lambda: self.fail('unfinished attempt invoked callback'))
+        assert isinstance(refused, self.api.Refusal)
+        self.assertEqual(refused.reason, 'unfinished_attempt')
+
     def test_recovery_postcommit_fsync_uncertainty_refuses_without_rollback_or_retry(self):
         from wag_protection.ledger import _SyntheticMaintenanceSession
 
@@ -1296,7 +1331,9 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
                 result = self.api.recover(root, authorization=authorization, decision='combined', proof=proof)
             assert isinstance(result, self.api.Refusal)
             self.assertEqual(result.reason, 'storage_error')
-            self.assertEqual(observed, [1], 'failure did not occur after a real durable SQLite commit')
+            self.assertEqual(
+                observed, [1, 1], 'failure did not occur after a real durable SQLite commit and poison attempt'
+            )
             after = (root / 'ledger.sqlite').read_bytes()
             self.assertTrue(after != before, 'test did not exercise postcommit uncertainty')
             with sqlite3.connect(root / 'ledger.sqlite') as db:
