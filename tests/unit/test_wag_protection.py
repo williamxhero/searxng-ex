@@ -643,9 +643,7 @@ print(json.dumps({'reason': getattr(result, 'reason', None)}), flush=True)
                         # The true transaction is still held at this boundary.
                         refused = self.api.open_store(root, manifest=manifest, mode='synthetic')
                         assert isinstance(refused, self.api.Refusal)
-                        self.assertEqual(
-                            refused.reason, 'lock_busy'
-                        )
+                        self.assertEqual(refused.reason, 'lock_busy')
                         process.kill()
                         process.wait(timeout=5)
                     # A real reopen performs SQLite hot-journal recovery after
@@ -877,7 +875,9 @@ print(json.dumps({'reason': getattr(result, 'reason', None)}), flush=True)
                                 session.seal()
                             self.assertEqual(error.exception.reason, 'evidence_unknown')
                         else:
-                            refused = self.api.recover(root, authorization=authorization, decision='combined', proof=proof)
+                            refused = self.api.recover(
+                                root, authorization=authorization, decision='combined', proof=proof
+                            )
                             assert isinstance(refused, self.api.Refusal)
                             self.assertEqual(
                                 refused.reason,
@@ -1932,9 +1932,7 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
                     self.assertEqual(db.execute('SELECT count(*) FROM attempts').fetchone()[0], 0)
                 snapshot_store = self.api.open_store(root, manifest=manifest, mode='synthetic')
                 assert not isinstance(snapshot_store, self.api.Refusal)
-                snapshot = snapshot_store.public_snapshot(
-                    manifest['artifact_digest'], manifest['config_digest']
-                )
+                snapshot = snapshot_store.public_snapshot(manifest['artifact_digest'], manifest['config_digest'])
                 assert isinstance(snapshot, self.api.Refusal)
                 self.assertEqual(snapshot.reason, 'clock_error')
 
@@ -2127,9 +2125,7 @@ store.run_engine('bing', caller='probe', deadline_mono=103.0,
             assert not isinstance(ingress_store, self.api.Refusal)
             refused = ingress_store.consume_release_ingress(release_id, artifact, config)
             assert isinstance(refused, self.api.Refusal)
-            self.assertEqual(
-                refused.reason, 'release_consumed'
-            )
+            self.assertEqual(refused.reason, 'release_consumed')
             return {
                 'version': 2,
                 'release_id': release_id,
@@ -2157,9 +2153,7 @@ store.run_engine('bing', caller='probe', deadline_mono=103.0,
         assert not isinstance(release_store, self.api.Refusal)
         refused = release_store.claim_release(release_id, artifact, config, self.now['mono'] + 10)
         assert isinstance(refused, self.api.Refusal)
-        self.assertEqual(
-            refused.reason, 'release_consumed'
-        )
+        self.assertEqual(refused.reason, 'release_consumed')
         self.assertEqual(calls, ['operation'])
         snapshot_store = self.open()
         assert not isinstance(snapshot_store, self.api.Refusal)
@@ -2233,7 +2227,9 @@ store.run_engine('bing', caller='probe', deadline_mono=103.0,
                 refused = self.api.open_store(self.root, manifest=manifest, mode='synthetic')
                 self.assertIsInstance(refused, self.api.Refusal)
                 self.assertEqual(refused.reason, 'provenance_error')
-                self.assertEqual(before, {path.name: path.read_bytes() for path in self.root.iterdir() if path.is_file()})
+                self.assertEqual(
+                    before, {path.name: path.read_bytes() for path in self.root.iterdir() if path.is_file()}
+                )
 
     def test_manifest_unbacked_wheel_hash_refuses_before_storage(self):
         manifest = {**self.manifest, 'wheels': {'httpx-0.28.1-py3-none-any.whl': 'a' * 64}}
@@ -2256,9 +2252,7 @@ store.run_engine('bing', caller='probe', deadline_mono=103.0,
             with self.subTest(manifest=list(manifest)):
                 refused = self.api.open_store(self.root, manifest=manifest, mode='synthetic')
                 assert isinstance(refused, self.api.Refusal)
-                self.assertEqual(
-                    refused.reason, 'provenance_error'
-                )
+                self.assertEqual(refused.reason, 'provenance_error')
 
 
 def _install_offline_test_guard():
