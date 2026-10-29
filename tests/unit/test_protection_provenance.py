@@ -319,6 +319,43 @@ class DependencyProvenanceTest(TestCase):  # pylint: disable=too-many-public-met
                     with self.assertRaises(ValueError):
                         self._validate(self._seal(manifest))
 
+    def test_production_accepts_canonical_wheel_directory_entries(self):
+        with zipfile.ZipFile(self.wheel, "a") as archive:
+            archive.writestr("wag_provenance_fixture/", b"")
+            archive.writestr(DIST_INFO + "/", b"")
+        manifest = self._manifest()
+        self.assertEqual(self._validate(manifest), manifest)
+
+    def test_production_rejects_unsafe_wheel_directories_and_special_files(self):
+        original = self.wheel.read_bytes()
+        entries = (
+            ("../outside/", 0o040000, b""),
+            ("/outside/", 0o040000, b""),
+            ("wag_provenance_fixture//", 0o040000, b""),
+            ("wag_provenance_fixture/", 0o120000, b""),
+            ("wag_provenance_fixture/", 0o100000, b""),
+            ("wag_provenance_fixture/", 0o040000, b"unexpected directory contents"),
+            (PAYLOAD + "/", 0o040000, b""),
+            ("unexpected_fifo", 0o010000, b""),
+        )
+        for name, file_type, contents in entries:
+            with self.subTest(name=name, file_type=file_type, contents=contents):
+                self.wheel.write_bytes(original)
+                info = zipfile.ZipInfo(name)
+                info.create_system = 3
+                info.external_attr = (file_type | 0o755) << 16
+                with zipfile.ZipFile(self.wheel, "a") as archive:
+                    archive.writestr(info, contents)
+                with self.assertRaises(ValueError):
+                    self._validate(self._manifest())
+
+    def test_production_rejects_duplicate_wheel_file_entries(self):
+        with zipfile.ZipFile(self.wheel, "a") as archive:
+            with self.assertWarns(UserWarning):
+                archive.writestr(PAYLOAD, self.payload[PAYLOAD])
+        with self.assertRaises(ValueError):
+            self._validate(self._manifest())
+
     def test_production_rejects_arbitrary_bytes_with_a_wheel_name(self):
         self.wheel.write_bytes(b"not a ZIP wheel")
         with self.assertRaises(ValueError):

@@ -377,12 +377,20 @@ def _wheel_payload(path):
     payload = {}
     try:
         with zipfile.ZipFile(path) as archive:
+            seen = set()
             for info in archive.infolist():
-                relative = _safe_dependency_path(info.filename)
-                if not info.filename or relative in (Path('.'),) or info.is_dir():
+                directory = info.is_dir()
+                name = info.filename[:-1] if directory else info.filename
+                relative = _safe_dependency_path(name)
+                if not name or relative == Path('.') or relative in seen:
                     raise ValueError('invalid wheel payload')
+                seen.add(relative)
                 file_type = (info.external_attr >> 16) & 0o170000
-                if file_type == 0o120000:
+                if directory:
+                    if file_type not in (0, 0o040000) or archive.read(info):
+                        raise ValueError('invalid wheel directory')
+                    continue
+                if file_type not in (0, 0o100000):
                     raise ValueError('invalid wheel payload')
                 contents = archive.read(info)
                 payload[info.filename] = (hashlib.sha256(contents).hexdigest(), len(contents), contents)
