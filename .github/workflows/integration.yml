@@ -76,6 +76,7 @@ jobs:
               "TMPDIR=$TMPDIR" \
               "PYTHONDONTWRITEBYTECODE=$PYTHONDONTWRITEBYTECODE" \
               "WAG_EXPECTED_HEAD=$WAG_EXPECTED_HEAD" \
+              "PATH=$PATH" \
               unshare --net -- \
               setpriv --reuid 0 --regid 1000 --clear-groups -- \
               local/py3/bin/python -m tests.unit.test_wag_protection --make ci.test
@@ -119,6 +120,7 @@ jobs:
               "TMPDIR=$TMPDIR" \
               "PYTHONDONTWRITEBYTECODE=$PYTHONDONTWRITEBYTECODE" \
               "WAG_EXPECTED_HEAD=$WAG_EXPECTED_HEAD" \
+              "PATH=$PATH" \
               unshare --net -- \
               setpriv --reuid 0 --regid 1000 --clear-groups -- \
               local/protection-venv/bin/python -m tests.unit.test_wag_protection --offline \
