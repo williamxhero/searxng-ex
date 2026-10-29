@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Match the repository test convention without renaming externally selected test IDs.
-# pylint: disable=missing-class-docstring,invalid-name,protected-access
+# pylint: disable=missing-class-docstring,invalid-name
 # Lazy imports keep native settings/network side effects inside prepared fixtures.
 # pylint: disable=import-outside-toplevel
 """Real native transport/parser components, on explicit synthetic loopback state."""
@@ -225,23 +225,6 @@ class ProtectedTransportTest(unittest.TestCase):  # pylint: disable=too-many-pub
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.addCleanup(self.stop_server)
-
-    def test_validated_store_uses_approved_production_mode(self):
-        from searx.network import protected
-
-        manifest_path = Path(self.parent.name) / 'production-artifact.json'
-        manifest_path.write_text(json.dumps({'mode': 'production'}), encoding='utf-8')
-        store = SimpleNamespace(manifest={'config_digest': 'resolved'})
-        config = {'artifact_manifest': str(manifest_path), 'root': str(self.root)}
-        with (
-            patch.object(protected, 'open_store', return_value=store) as open_store,
-            patch.object(protected, 'resolved_config_digest', return_value='resolved'),
-        ):
-            self.assertIs(
-                protected._validated_store(config, {'engines': [], 'outgoing': {}}),
-                store,
-            )
-        open_store.assert_called_once_with(str(self.root), manifest={'mode': 'production'}, mode='production')
 
     def stop_server(self):
         self.server.shutdown()

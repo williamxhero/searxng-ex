@@ -102,7 +102,11 @@ def _validated_store(config, runtime_settings):
     if len(raw) > 128 * 1024:
         return Refusal('provenance_error')
     manifest = load_json(raw.decode('utf-8'))
-    store = open_store(config['root'], manifest=manifest, mode=manifest['mode'])
+    # This partial native slice has no production acceptance. Keep it held
+    # until the remaining lifecycle, migration, recovery and CI gates pass.
+    if manifest['mode'] != 'synthetic':
+        return Refusal('operator_hold')
+    store = open_store(config['root'], manifest=manifest, mode='synthetic')
     if isinstance(store, Refusal):
         return store
     if store.manifest['config_digest'] != resolved_config_digest(
@@ -137,6 +141,10 @@ def protection_descriptor():
         manifest = validate_manifest(manifest, Path(config['root']), manifest['mode'])
         descriptor.update(artifact_digest=manifest['artifact_digest'], registry_digest=manifest['registry_digest'])
         if descriptor['config_digest'] != manifest['config_digest']:
+            return descriptor
+        # Retain the production acceptance hold; this descriptor is no permit.
+        if manifest['mode'] != 'synthetic':
+            descriptor['reason'] = 'operator_hold'
             return descriptor
         store = open_store(config['root'], manifest=manifest, mode=manifest['mode'], readonly=True)
         refusal = store if isinstance(store, Refusal) else store.check_admission()
