@@ -243,6 +243,16 @@ class OnlineProcessor(EngineProcessor):
 
         self.init_network_in_thread(start_time, timeout_limit)
 
+        def reject_explicit_challenge(response):
+            # An explicit challenge must not become a plain error or a
+            # successful result merely because the HTTP status is 200.
+            headers = response.headers
+            if (
+                headers.get('Server', '').lower().startswith('cloudflare')
+                and headers.get('cf-mitigated', '').strip().lower() == 'challenge'
+            ):
+                raise EngineFailure('challenge_unknown') from None
+
         def classified(operation):
             try:
                 return operation()
@@ -252,6 +262,11 @@ class OnlineProcessor(EngineProcessor):
                 raise EngineFailure('rate_limited', suspension_s=error.suspended_time or 0) from None
             except SearxEngineAccessDeniedException as error:
                 raise EngineFailure('access_denied', suspension_s=error.suspended_time or 0) from None
+            except httpx.HTTPStatusError as error:
+                # Known native CAPTCHA/denial exceptions above keep their
+                # classification and requested suspension before this fallback.
+                reject_explicit_challenge(error.response)
+                raise
 
         def build():
             self.engine.request(query, params)
@@ -261,7 +276,17 @@ class OnlineProcessor(EngineProcessor):
 
         def parse(response):
             response.search_params = params
-            return classified(lambda: self.engine.response(response))
+            try:
+                results = classified(lambda: self.engine.response(response))
+            except EngineFailure:
+                # Preserve known native classification and suspension first.
+                raise
+            except Exception:  # pylint: disable=broad-except
+                # A parser failure alone is not a challenge signal.
+                reject_explicit_challenge(response)
+                raise
+            reject_explicit_challenge(response)
+            return results
 
         return store.run_engine(
             self.engine.name,

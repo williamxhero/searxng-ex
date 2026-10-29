@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -67,6 +68,7 @@ class CountedServer(ThreadingHTTPServer):
         self.accepts = 0
         self.headers = 0
         self.connect_headers = 0
+        self.responses = {}
         self.tunnel_port = None
         self.request_entered = threading.Event()
         self.body_release = threading.Event()
@@ -93,7 +95,11 @@ class FixtureHandler(BaseHTTPRequestHandler):
         content = {'www.bing.com': BING_RESULT, 'www.chinaso.com': CHINASO_RESULT, 'yandex.com': YANDEX_RESULT}.get(
             host, QUARK_RESULT
         )
-        self.send_response(200)
+        status, headers, content = self.server.responses.get(host, (200, {}, content))
+        # Do not prepend BaseHTTPServer's Server header to a native CF fixture.
+        self.send_response_only(status)
+        for name, value in headers.items():
+            self.send_header(name, value)
         self.send_header('Content-Length', str(len(content)))
         self.end_headers()
         self.wfile.write(content)
@@ -297,7 +303,7 @@ class ProtectedTransportTest(unittest.TestCase):
             parse=engine.response,
         )
 
-    def native_search_fixture(self):
+    def native_search_fixture(self, *, include_yandex=False):
         from copy import deepcopy
         import sqlite3
         from flask import Flask
@@ -337,6 +343,17 @@ class ProtectedTransportTest(unittest.TestCase):
                 'quark_category': 'general',
             },
         ]
+        if include_yandex:
+            engine_settings.append(
+                {
+                    'name': 'yandex',
+                    'engine': 'yandex',
+                    'categories': ['general'],
+                    'shortcut': 'ya',
+                    'timeout': 3.0,
+                    'search_type': 'web',
+                }
+            )
         approved = registry()
         for entry in approved:
             configured = next((engine for engine in engine_settings if engine['name'] == entry['engine']), None)
@@ -1010,6 +1027,230 @@ print(json.dumps({'reason': getattr(result, 'reason', None), 'calls': calls}))
         for raw in ['false', 'true', 0, 1, None]:
             with self.subTest(raw=raw):
                 self.assertTrue(apply_schema({'wag_protection': {'enabled': raw}}, SCHEMA['outgoing'], ['outgoing']))
+
+    def test_native_challenge_denial_matrix_persists_pause_before_second_sender(self):
+        """AC-A4: real native classification must durably gate the next sender."""
+        from searx import settings
+        from searx.network.protected import get_store
+        from searx.search.processors import PROCESSORS
+
+        search, _, manifest = self.native_search_fixture(include_yandex=True)
+        # These are native parser/HTTP contracts, not EngineFailure substitutes.
+        # Quark's HTTP-200 X5SEC page raises its real 900-second exception;
+        # the durable protection floor must still be 1800 seconds.
+        malformed_quark = b'<script type="application/json" id="s-data-fixture" data-used-by="hydrate">{</script>'
+        cases = [
+            (
+                'quark-200-captcha',
+                'quark',
+                200,
+                {},
+                b'<script>{"action":"captcha","url":"https://fixture.invalid/x5sec"}</script>',
+                'captcha',
+                1800,
+            ),
+            ('yandex-header', 'yandex', 200, {'x-yandex-captcha': 'captcha'}, YANDEX_RESULT, 'captcha', 3600),
+            (
+                # The real parser's known CAPTCHA must win over a generic CF
+                # challenge fallback, including its longer suspension request.
+                'yandex-200-captcha-with-cf',
+                'yandex',
+                200,
+                {'x-yandex-captcha': 'captcha', 'Server': 'cloudflare', 'cf-mitigated': 'challenge'},
+                YANDEX_RESULT,
+                'captcha',
+                3600,
+            ),
+            (
+                # Quark's real 900-second CAPTCHA must retain its classification
+                # even though both it and unknown challenges have an 1800 floor.
+                'quark-200-captcha-with-cf',
+                'quark',
+                200,
+                {'Server': 'cloudflare', 'cf-mitigated': 'challenge'},
+                b'<script>{"action":"captcha","url":"https://fixture.invalid/x5sec"}</script>',
+                'captcha',
+                1800,
+            ),
+            (
+                'cloudflare-js',
+                'quark',
+                503,
+                {'Server': 'cloudflare'},
+                b'<html>__cf_chl_jschl_tk__=synthetic</html>',
+                'captcha',
+                1296000,
+            ),
+            (
+                'cloudflare-captcha',
+                'quark',
+                403,
+                {'Server': 'cloudflare'},
+                b'<html>__cf_chl_captcha_tk__=synthetic</html>',
+                'captcha',
+                1296000,
+            ),
+            (
+                'cloudflare-firewall',
+                'quark',
+                403,
+                {'Server': 'cloudflare'},
+                b'<html><span class="cf-error-code">1020</span></html>',
+                'access_denied',
+                86400,
+            ),
+            (
+                'recaptcha',
+                'quark',
+                503,
+                {},
+                b'<html><script src="https://www.google.com/recaptcha/api.js"></script></html>',
+                'captcha',
+                604800,
+            ),
+            ('http-403', 'quark', 403, {}, b'<html>Forbidden</html>', 'access_denied', 1800),
+            ('http-429', 'quark', 429, {}, b'<html>Too many requests</html>', 'rate_limited', 1800),
+            (
+                # Recognizably a challenge, but not either legacy CF signature.
+                # It must not silently become an ordinary HTTP error with no pause.
+                'cloudflare-unknown',
+                'quark',
+                503,
+                {'Server': 'cloudflare', 'cf-mitigated': 'challenge'},
+                b'<html><script src="/cdn-cgi/challenge-platform/unknown/v2"></script></html>',
+                'challenge_unknown',
+                1800,
+            ),
+            (
+                # Even a normally parseable result must not override the
+                # origin's explicit challenge signal on an HTTP-200 response.
+                'cloudflare-200-unknown',
+                'quark',
+                200,
+                {'Server': 'cloudflare', 'cf-mitigated': 'challenge'},
+                QUARK_RESULT,
+                'challenge_unknown',
+                1800,
+            ),
+            (
+                'cloudflare-200-empty',
+                'quark',
+                200,
+                {'Server': 'cloudflare', 'cf-mitigated': 'challenge'},
+                b'<html>No results</html>',
+                'challenge_unknown',
+                1800,
+            ),
+            (
+                'cloudflare-200-parser-error',
+                'quark',
+                200,
+                {'Server': 'cloudflare', 'cf-mitigated': 'challenge'},
+                malformed_quark,
+                'challenge_unknown',
+                1800,
+            ),
+            (
+                # The same real JSON parser failure without a challenge signal
+                # must stay a parser error, with no invented CAPTCHA pause.
+                'http-200-parser-error-unmarked',
+                'quark',
+                200,
+                {'Server': 'cloudflare'},
+                malformed_quark,
+                'parser_error',
+                None,
+            ),
+            (
+                # Server branding/status alone are not a challenge signal.
+                'http-503-unmarked',
+                'quark',
+                503,
+                {'Server': 'cloudflare'},
+                b'<html>Service unavailable</html>',
+                'error',
+                None,
+            ),
+        ]
+        hosts = {'quark': 'quark.sm.cn', 'yandex': 'yandex.com'}
+        healthy = {'quark': QUARK_RESULT, 'yandex': YANDEX_RESULT}
+        boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+        for label, name, status, headers, body, outcome, floor in cases:
+            with self.subTest(case=label):
+                # Each case gets independent, explicitly synthetic state; never
+                # reset a live ledger or let earlier cases mask one another.
+                root = Path(self.parent.name) / label
+                now = {'wall': time.time(), 'mono': time.monotonic(), 'boot': boot}
+                # Control only the ledger's clock boundary. Asyncio, native TLS,
+                # sockets and engine request/response implementations stay real.
+                clock = SimpleNamespace(time=lambda: now['wall'], monotonic=lambda: now['mono'])
+                with patch('wag_protection.ledger.time', clock):
+                    self.api.initialize_fixture(root, registry=manifest['registry'], clock=lambda: dict(now))
+                    case_manifest = fixture_manifest(root, manifest['registry'])
+                    case_manifest['config_digest'] = manifest['config_digest']
+                    manifest_path = Path(self.parent.name) / (label + '-artifact.json')
+                    manifest_path.write_text(json.dumps(case_manifest), encoding='utf-8')
+                    config = {'enabled': True, 'root': str(root), 'artifact_manifest': str(manifest_path)}
+                    with patch.dict(settings['outgoing'], {'wag_protection': config}):
+                        processor = PROCESSORS[name]
+
+                        def dispatch():
+                            # A new validated handle for every attempt: the pause
+                            # must survive reopen, not just native memory state.
+                            store = get_store()
+                            self.assertNotIsInstance(store, self.api.Refusal)
+                            params = processor.get_params(search.search_query, 'general')
+                            self.assertIsNotNone(params)
+                            return processor.search_protected(
+                                search.search_query.query, params, store, now['mono'], 3.0
+                            )
+
+                        # Independent matrix fixtures must not reuse a socket
+                        # armed by an earlier dispatch/store identity.
+                        self.tls_server.responses = {hosts[name]: (status, {'Connection': 'close', **headers}, body)}
+                        before = (self.tls_server.accepts, self.tls_server.headers)
+                        result = dispatch()
+                        self.assertIsInstance(result, self.api.EngineOutcome)
+                        self.assertEqual(
+                            (self.tls_server.accepts, self.tls_server.headers), (before[0] + 1, before[1] + 1)
+                        )
+                        self.assertEqual(
+                            (result.reservations, result.connection_attempts, result.http_attempts), (1, 1, 1)
+                        )
+                        with self.subTest(stage='classification'):
+                            self.assertEqual(result.outcome, outcome)
+
+                        # A genuinely useful response is available for the next
+                        # sender. Only durable admission may prevent its send.
+                        self.tls_server.responses = {hosts[name]: (200, {'Connection': 'close'}, healthy[name])}
+                        if floor is None:
+                            with self.subTest(stage='unmarked-error-does-not-pause'):
+                                before = (self.tls_server.accepts, self.tls_server.headers)
+                                recovered = dispatch()
+                                self.assertIsInstance(recovered, self.api.EngineOutcome)
+                                self.assertEqual((recovered.outcome, recovered.result_count), ('ok', 1))
+                                self.assertEqual(
+                                    (recovered.reservations, recovered.connection_attempts, recovered.http_attempts),
+                                    (1, 1, 1),
+                                )
+                                self.assertEqual(
+                                    (self.tls_server.accepts, self.tls_server.headers), (before[0] + 1, before[1] + 1)
+                                )
+                                self.assertEqual(recovered.results[0]['title'], 'Synthetic source')
+                            continue
+                        for elapsed in (0, floor - 0.001):
+                            now['wall'] += elapsed
+                            now['mono'] += elapsed
+                            with self.subTest(stage='durable-cooldown', elapsed=elapsed):
+                                counts = (self.tls_server.accepts, self.tls_server.headers, len(self.client_sockets))
+                                denied = dispatch()
+                                self.assertEqual(
+                                    (self.tls_server.accepts, self.tls_server.headers, len(self.client_sockets)),
+                                    counts,
+                                    'a reopened sender must not connect or send headers during the durable pause',
+                                )
+                                self.assertIsInstance(denied, self.api.Refusal)
+                                self.assertEqual(denied.reason, 'cooldown')
 
     def test_direct_http_charges_one_connect_and_header_and_real_quark_parser(self):
         import httpx
