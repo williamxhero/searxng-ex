@@ -9,6 +9,7 @@ from hashlib import sha256
 import importlib.metadata
 import io
 import os
+import py_compile
 from pathlib import Path
 import sys
 import tempfile
@@ -50,7 +51,7 @@ NATIVE_FILES = (
 )
 
 
-class DependencyProvenanceTest(TestCase):
+class DependencyProvenanceTest(TestCase):  # pylint: disable=too-many-public-methods
     def setUp(self):
         # Real, disposable distribution metadata, not a new runtime dependency.
         self.temporary = tempfile.TemporaryDirectory(  # pylint: disable=consider-using-with
@@ -169,6 +170,45 @@ class DependencyProvenanceTest(TestCase):
         manifest = self._manifest()
         self.assertEqual(self._validate(manifest), manifest)
         self.assertTrue(manifest["registry"][0]["profile"]["live_hold"])
+
+    def test_production_accepts_explicitly_approved_installation_outputs(self):
+        installer = self.site / DIST_INFO / "INSTALLER"
+        installer.write_bytes(b"pip\n")
+        requested = self.site / DIST_INFO / "REQUESTED"
+        requested.write_bytes(b"")
+        bytecode = Path(py_compile.compile(str(self.site / PAYLOAD), doraise=True))
+        record = self.site / DIST_INFO / "RECORD"
+        # pip preserves shipped payload but rewrites RECORD for generated files.
+        record.write_bytes(
+            self._record()
+            + (DIST_INFO + "/INSTALLER,,\n" + DIST_INFO + "/REQUESTED,,\n").encode()
+            + (str(bytecode.relative_to(self.site)) + ",,\n").encode()
+        )
+        manifest = self._manifest()
+        for path in (installer, requested, bytecode, record):
+            manifest["files"][str(path.relative_to(WORKSPACE))] = sha256(path.read_bytes()).hexdigest()
+        manifest = self._seal(manifest)
+        self.assertEqual(self._validate(manifest), manifest)
+        for path in (installer, requested, bytecode, record):
+            with self.subTest(unapproved=path.name):
+                relative = str(path.relative_to(WORKSPACE))
+                expected = manifest["files"].pop(relative)
+                with self.assertRaises(ValueError):
+                    self._validate(self._seal(manifest))
+                manifest["files"][relative] = expected
+        self._seal(manifest)
+        bytecode.write_bytes(b"unapproved executable bytecode")
+        with self.assertRaises(ValueError):
+            self._validate(manifest)
+
+    def test_production_rejects_changed_wheel_payload_even_in_installed_inventory(self):
+        path = self.site / NATIVE_PAYLOAD
+        path.write_bytes(b"changed executable payload")
+        manifest = self._manifest()
+        manifest["files"][str(path.relative_to(WORKSPACE))] = sha256(path.read_bytes()).hexdigest()
+        # An installed-artifact hash cannot override the wheel's shipped code.
+        with self.assertRaises(ValueError):
+            self._validate(self._seal(manifest))
 
     def test_production_rejects_arbitrary_bytes_with_a_wheel_name(self):
         self.wheel.write_bytes(b"not a ZIP wheel")

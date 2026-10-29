@@ -473,12 +473,27 @@ def _validate_dependency_provenance(distributions, wheels, files, mode):
                           if Path(path).name == name and digest == expected)
         wheel_payload = _wheel_payload(canonical_path(Path(__file__).resolve().parent.parent / wheel_path))
         _validate_wheel_metadata(name, wheel_payload, distribution, version)
-        installed_payload = _installed_payload(installed[distribution][1])
-        if set(wheel_payload) != set(installed_payload):
+        installed_distribution = installed[distribution][1]
+        installed_payload = _installed_payload(installed_distribution)
+        if not set(wheel_payload).issubset(installed_payload):
             raise ValueError('installed payload mismatch')
-        for payload_name, (digest, size, _) in wheel_payload.items():
-            if installed_payload[payload_name][:2] != (digest, size):
-                raise ValueError('installed payload mismatch')
+        metadata_name = next(path for path in wheel_payload if path.endswith('.dist-info/METADATA'))
+        record_name = str(Path(metadata_name).with_name('RECORD'))
+        module_root = canonical_path(Path(__file__).resolve().parent.parent)
+        for payload_name, (digest, size, _) in installed_payload.items():
+            if payload_name in wheel_payload and payload_name != record_name:
+                if wheel_payload[payload_name][:2] != (digest, size):
+                    raise ValueError('installed payload mismatch')
+            elif payload_name == record_name and wheel_payload.get(payload_name, ())[:2] == (digest, size):
+                continue
+            else:
+                # Only explicitly approved installed bytes may differ from the
+                # wheel (RECORD, installer metadata, bytecode, etc.). Never infer
+                # approval from a filename suffix or the installer's own hashes.
+                path = canonical_path(installed_distribution.locate_file(payload_name))
+                relative = str(path.relative_to(module_root))
+                if files.get(relative) != digest:
+                    raise ValueError('unapproved installation output')
         wheel_distributions.add(distribution)
     if mode == 'production' and wheel_distributions != set(installed):
         raise ValueError('incomplete dependency provenance')
