@@ -399,8 +399,8 @@ def initialize(
     settings_outgoing = settings_outgoing or settings['outgoing']
     protection_enabled = settings_outgoing.get('wag_protection', {}).get('enabled') is True
 
-    # default parameters for AsyncHTTPTransport
-    # see https://github.com/encode/httpx/blob/e05a5372eb6172287458b37447c30f650047e1b8/httpx/_transports/default.py#L108-L121  # pylint: disable=line-too-long
+    # Default parameters for AsyncHTTPTransport. See its implementation for the
+    # corresponding defaults in the pinned httpx dependency.
     default_params: dict[str, t.Any] = {
         'enable_http': False,
         'verify': settings_outgoing['verify'],

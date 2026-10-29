@@ -2,8 +2,13 @@
 """The canonical outbound-protection wire and storage contract."""
 
 from dataclasses import dataclass, field
+import base64
+import binascii
+import csv
+import email.message
 import hashlib
 import importlib.metadata
+import io
 import json
 import math
 import os
@@ -11,6 +16,7 @@ from pathlib import Path
 import re
 import sys
 from typing import Literal, NotRequired, TypeGuard, TypedDict, cast
+import zipfile
 
 CONTRACT = 'wag.outbound.v2'
 VERSION = 2
@@ -335,6 +341,144 @@ def validate_registry(registry):
     return registry
 
 
+def _normalise_distribution_name(name):
+    return re.sub(r'[-_.]+', '-', name).lower()
+
+
+def _wheel_identity(name):
+    parts = Path(name).stem.split('-')
+    if len(parts) not in (5, 6) or any(not part for part in parts):
+        raise ValueError('invalid wheel declaration')
+    return _normalise_distribution_name(parts[0]), parts[1]
+
+
+def _record_digest(value):
+    if not value.startswith('sha256='):
+        raise ValueError('invalid installed record')
+    encoded = value[7:]
+    try:
+        return base64.urlsafe_b64decode(encoded + '=' * (-len(encoded) % 4)).hex()
+    except (ValueError, binascii.Error) as error:
+        raise ValueError('invalid installed record') from error
+
+
+def _safe_dependency_path(name):
+    path = Path(name)
+    if path.is_absolute() or '..' in path.parts or str(path) != name:
+        raise ValueError('invalid installed record')
+    return path
+
+
+def _wheel_payload(path):
+    if path.stat().st_size > 64 * 1024 * 1024:
+        raise ValueError('wheel too large')
+    payload = {}
+    try:
+        with zipfile.ZipFile(path) as archive:
+            for info in archive.infolist():
+                relative = _safe_dependency_path(info.filename)
+                if not info.filename or relative in (Path('.'),) or info.is_dir():
+                    raise ValueError('invalid wheel payload')
+                file_type = (info.external_attr >> 16) & 0o170000
+                if file_type == 0o120000:
+                    raise ValueError('invalid wheel payload')
+                contents = archive.read(info)
+                payload[info.filename] = (hashlib.sha256(contents).hexdigest(), len(contents), contents)
+    except (OSError, ValueError, zipfile.BadZipFile) as error:
+        raise ValueError('invalid wheel payload') from error
+    if not payload:
+        raise ValueError('invalid wheel payload')
+    return payload
+
+
+def _installed_payload(distribution):
+    record = distribution.read_text('RECORD')
+    if not record:
+        raise ValueError('missing installed record')
+    root = canonical_path(distribution.locate_file(''))
+    payload = {}
+    for row in csv.reader(io.StringIO(record)):
+        if len(row) != 3:
+            raise ValueError('invalid installed record')
+        name, digest, size = row
+        relative = _safe_dependency_path(name)
+        path = canonical_path(root / relative)
+        if root not in path.parents or path.is_symlink() or not path.is_file():
+            raise ValueError('invalid installed payload')
+        contents = path.read_bytes()
+        if digest and hashlib.sha256(contents).hexdigest() != _record_digest(digest):
+            raise ValueError('installed payload mismatch')
+        if size and (not size.isdigit() or int(size) != len(contents)):
+            raise ValueError('installed payload mismatch')
+        payload[name] = (hashlib.sha256(contents).hexdigest(), len(contents), contents)
+    return payload
+
+
+def _validate_wheel_metadata(wheel_name, wheel_payload, distribution, version):
+    metadata_names = [name for name in wheel_payload if name.endswith('.dist-info/METADATA')]
+    if len(metadata_names) != 1:
+        raise ValueError('invalid wheel metadata')
+    metadata = email.message_from_bytes(wheel_payload[metadata_names[0]][2])
+    if (_normalise_distribution_name(metadata.get('Name', '')) != distribution
+            or metadata.get('Version') != version):
+        raise ValueError('wheel metadata mismatch')
+    if not any(name.endswith('.dist-info/RECORD') for name in wheel_payload):
+        raise ValueError('missing wheel record')
+    if _normalise_distribution_name(metadata.get('Name', '')) != _wheel_identity(wheel_name)[0]:
+        raise ValueError('wheel metadata mismatch')
+
+
+def _validate_dependency_provenance(distributions, wheels, files, mode):
+    if not isinstance(distributions, dict) or not isinstance(wheels, dict):
+        raise ValueError('invalid dependencies')
+    if mode == 'production' and (not distributions or not wheels):
+        raise ValueError('missing dependency provenance')
+
+    installed = {}
+    for name, version in distributions.items():
+        if (not isinstance(name, str)
+                or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', name)
+                or not isinstance(version, str) or not version):
+            raise ValueError('invalid dependency declaration')
+        normalised = _normalise_distribution_name(name)
+        if normalised in installed:
+            raise ValueError('duplicate dependency declaration')
+        distribution = importlib.metadata.distribution(name)
+        if distribution.version != version:
+            raise ValueError('dependency mismatch')
+        installed[normalised] = (version, distribution)
+
+    wheel_distributions = set()
+    for name, expected in wheels.items():
+        if Path(name).name != name or not name.endswith('.whl') or not hex_value(expected, 64):
+            raise ValueError('invalid wheel declaration')
+        distribution, version = _wheel_identity(name)
+        if distribution not in installed or installed[distribution][0] != version:
+            raise ValueError('wheel dependency mismatch')
+        # A declared hash is not provenance without the approved wheel bytes.
+        # Bind it to exactly one artifact-relative file already checked above;
+        # no extra manifest field or implicit external wheel cache is trusted.
+        matches = [
+            path for path, digest in files.items()
+            if Path(path).name == name and digest == expected
+        ]
+        if len(matches) != 1:
+            raise ValueError('unverified wheel artifact')
+        wheel_path = next(path for path, digest in files.items()
+                          if Path(path).name == name and digest == expected)
+        wheel_payload = _wheel_payload(canonical_path(Path(__file__).resolve().parent.parent / wheel_path))
+        _validate_wheel_metadata(name, wheel_payload, distribution, version)
+        installed_payload = _installed_payload(installed[distribution][1])
+        if set(wheel_payload) != set(installed_payload):
+            raise ValueError('installed payload mismatch')
+        for payload_name, (digest, size, _) in wheel_payload.items():
+            if installed_payload[payload_name][:2] != (digest, size):
+                raise ValueError('installed payload mismatch')
+        wheel_distributions.add(distribution)
+    if mode == 'production' and wheel_distributions != set(installed):
+        raise ValueError('incomplete dependency provenance')
+
+
 def validate_manifest(manifest, root, mode):
     if not isinstance(manifest, dict):
         path = canonical_path(manifest)
@@ -370,7 +514,10 @@ def validate_manifest(manifest, root, mode):
     if module_root != Path(__file__).resolve().parent.parent:
         raise ValueError('shadow module')
     python = canonical_path(manifest['python_executable'])
-    if python != Path(sys.executable).resolve() or hashlib.sha256(python.read_bytes()).hexdigest() != manifest['python_digest']:
+    if (
+        python != Path(sys.executable).resolve()
+        or hashlib.sha256(python.read_bytes()).hexdigest() != manifest['python_digest']
+    ):
         raise ValueError('unapproved interpreter')
     files = manifest['files']
     if not isinstance(files, dict) or not files:
@@ -393,22 +540,7 @@ def validate_manifest(manifest, root, mode):
     )
     if any(name not in files for name in required_files):
         raise ValueError('missing native artifact file')
-    distributions = manifest['distributions']
-    wheels = manifest['wheels']
-    if not isinstance(distributions, dict) or not isinstance(wheels, dict):
-        raise ValueError('invalid dependencies')
-    for name, version in distributions.items():
-        if not isinstance(version, str) or importlib.metadata.version(name) != version:
-            raise ValueError('dependency mismatch')
-    for name, expected in wheels.items():
-        if Path(name).name != name or not name.endswith('.whl') or not hex_value(expected, 64):
-            raise ValueError('invalid wheel declaration')
-        # A declared hash is not provenance without the approved wheel bytes.
-        # Bind it to exactly one artifact-relative file already checked above;
-        # no extra manifest field or implicit external wheel cache is trusted.
-        matches = [path for path, digest in files.items() if Path(path).name == name and digest == expected]
-        if len(matches) != 1:
-            raise ValueError('unverified wheel artifact')
+    _validate_dependency_provenance(manifest['distributions'], manifest['wheels'], files, mode)
     registry = validate_registry(manifest['registry'])
     if json_digest(registry) != manifest['registry_digest']:
         raise ValueError('registry mismatch')
