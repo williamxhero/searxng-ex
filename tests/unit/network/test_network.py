@@ -105,6 +105,56 @@ class TestNetwork(SearxTestCase):
 
         await network.aclose()
 
+    async def test_protected_tor_refused_before_client_side_effects(self):
+        from wag_protection import ProtectionError  # pylint: disable=import-outside-toplevel
+
+        network = Network(
+            protected=True,
+            local_addresses=['127.0.0.1', '127.0.0.2'],
+            proxies={'https': ['http://localhost:1337', 'http://localhost:1339']},
+        )
+        # The public attributes may change after constructor validation.
+        network.using_tor_proxy = True
+        with (
+            patch('searx.network.network.new_client') as create_client,
+            patch.object(Network, 'check_tor_proxy', return_value=True) as check_tor,
+            patch('asyncio.run_coroutine_threadsafe') as schedule,
+        ):
+            with self.assertRaises(ProtectionError) as refusal:
+                await network.get_client()
+            create_client.assert_not_called()
+            check_tor.assert_not_called()
+            schedule.assert_not_called()
+            self.assertEqual(next(network._local_addresses_cycle), '127.0.0.1')
+            self.assertEqual(next(network._proxies_cycle), (('https://', 'http://localhost:1337'),))
+            self.assertEqual(refusal.exception.reason, 'route_unsupported')
+
+    async def test_off_mode_tor_check_and_client_cache_unchanged(self):
+        for is_tor in (True, False):
+            with self.subTest(is_tor=is_tor), patch.dict(Network._TOR_CHECK_RESULT, {}, clear=True):
+                tor_requests = []
+
+                def tor_response(request, result=is_tor, requests=tor_requests):
+                    requests.append(str(request.url))
+                    return httpx.Response(200, json={'IsTor': result})
+
+                # Exercise the real Tor check without opening any sockets.
+                async with httpx.AsyncClient(transport=httpx.MockTransport(tor_response), trust_env=False) as client:
+                    network = Network(using_tor_proxy=True, proxies='http://localhost:1337', protected=False)
+                    with patch('searx.network.network.new_client', return_value=client) as create_client:
+                        if is_tor:
+                            self.assertIs(await network.get_client(), client)
+                            self.assertIs(await network.get_client(), client)
+                            self.assertFalse(client.is_closed)
+                        else:
+                            with self.assertRaisesRegex(
+                                httpx.ProxyError, 'Network configuration problem: not using Tor'
+                            ):
+                                await network.get_client()
+                            self.assertTrue(client.is_closed)
+                        create_client.assert_called_once()
+                        self.assertEqual(tor_requests, ['https://check.torproject.org/api/ip'])
+
     async def test_aclose(self):
         network = Network(verify=True)
         await network.get_client()

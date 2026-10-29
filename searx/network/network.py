@@ -198,6 +198,11 @@ class Network:
         return result
 
     async def get_client(self, verify: bool | None = None, max_redirects: int | None = None) -> httpx.AsyncClient:
+        if self.protected and self.using_tor_proxy:
+            from wag_protection import ProtectionError  # pylint: disable=import-outside-toplevel
+
+            raise ProtectionError('route_unsupported')
+
         from searx import settings  # pylint: disable=import-outside-toplevel
 
         if settings['outgoing'].get('wag_protection', {}).get('enabled', False) is not False and not self.protected:
