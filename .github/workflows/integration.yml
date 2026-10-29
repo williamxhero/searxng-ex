@@ -59,7 +59,7 @@ jobs:
         run: make V=1 install
 
       - name: Provision test tools before network isolation
-        run: make V=1 gecko.driver go.env.dev
+        run: make V=1 gecko.driver go.env.dev test.shfmt
 
       - name: Run tests
         env:
