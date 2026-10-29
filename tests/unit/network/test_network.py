@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # pylint: disable=missing-module-docstring,disable=missing-class-docstring,invalid-name
 
+import asyncio
 import copy
+from contextlib import asynccontextmanager
 
 import httpx
 from mock import patch
@@ -10,6 +12,228 @@ from searx import settings
 from searx.network.network import Network, NETWORKS
 from searx.network.network import initialize
 from tests import SearxTestCase
+
+
+class TestNetworkLifecycle(SearxTestCase):
+    # pylint: disable=protected-access
+
+    async def test_aclose_waits_for_inflight_request_before_closing_generation(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def request(*args, **kwargs):  # pylint: disable=unused-argument
+            started.set()
+            await release.wait()
+            return httpx.Response(200)
+
+        network = Network(enable_http=True)
+        with patch.object(httpx.AsyncClient, 'request', new=request):
+            request_task = asyncio.create_task(network.request('GET', 'https://example.com/'))
+            await started.wait()
+            client = next(iter(network._clients.values()))
+            close_task = asyncio.create_task(network.aclose())
+            await asyncio.sleep(0)
+            self.assertFalse(client.is_closed)
+            release.set()
+            await request_task
+            await close_task
+
+        self.assertTrue(client.is_closed)
+        self.assertEqual(network._clients, {})
+        with self.assertRaises(RuntimeError):
+            await network.get_client()
+
+    async def test_aclose_keeps_stream_open_until_context_exits(self):
+        @asynccontextmanager
+        async def stream(client, *args, **kwargs):  # pylint: disable=unused-argument
+            yield httpx.Response(200, text='stream')
+
+        network = Network()
+        close_task = None
+        try:
+            with patch.object(httpx.AsyncClient, 'stream', new=stream):
+                async with await network.stream('GET', 'https://example.com/') as response:
+                    close_task = asyncio.create_task(network.aclose())
+                    await asyncio.wait({close_task}, timeout=0.05)
+                    self.assertEqual(response.text, 'stream')
+                    self.assertFalse(close_task.done(), 'close crossed a live stream context')
+            await close_task
+        finally:
+            if close_task is not None:
+                await close_task
+
+    async def test_failed_close_refuses_reuse_of_uncertain_clients(self):
+        network = Network()
+        client = await network.get_client()
+        with patch.object(httpx.AsyncClient, 'aclose', side_effect=RuntimeError('synthetic close fault')):
+            with self.assertRaises(RuntimeError):
+                await network.aclose()
+        try:
+            with self.assertRaises(RuntimeError):
+                await network.get_client()
+        finally:
+            await client.aclose()
+
+    async def test_group_close_drains_all_networks_before_closing_any_client(self):
+        first, second = Network(), Network()
+        first_client = await first.get_client()
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def request(client, *args, **kwargs):  # pylint: disable=unused-argument
+            started.set()
+            await release.wait()
+            return httpx.Response(200, text='complete')
+
+        with patch.object(httpx.AsyncClient, 'request', new=request):
+            request_task = asyncio.create_task(second.request('GET', 'https://example.com/'))
+            await started.wait()
+            close_task = asyncio.create_task(Network.aclose_all([first, second]))
+            try:
+                await asyncio.wait({close_task}, timeout=0.05)
+                self.assertFalse(first_client.is_closed, 'close crossed the generation drain barrier')
+            finally:
+                release.set()
+                await request_task
+                await close_task
+        self.assertTrue(first_client.is_closed)
+
+    async def test_close_waits_for_pending_tor_client_validation(self):
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def tor_response(client, *args, **kwargs):  # pylint: disable=unused-argument
+            started.set()
+            await release.wait()
+            return httpx.Response(200, json={'IsTor': True})
+
+        network = Network(using_tor_proxy=True)
+        with (
+            patch.dict(Network._TOR_CHECK_RESULT, {}, clear=True),
+            patch.object(httpx.AsyncClient, 'get', new=tor_response),
+        ):
+            create_task = asyncio.create_task(network.get_client())
+            await started.wait()
+            close_task = asyncio.create_task(network.aclose())
+            try:
+                await asyncio.wait({close_task}, timeout=0.05)
+                self.assertFalse(close_task.done(), 'close crossed pending client construction')
+            finally:
+                release.set()
+                client = await create_task
+                await close_task
+                await client.aclose()
+            self.assertTrue(client.is_closed)
+            with self.assertRaises(RuntimeError):
+                await network.get_client()
+
+    async def test_cancelled_client_validation_closes_unpublished_client(self):
+        started = asyncio.Event()
+        client = httpx.AsyncClient()
+
+        async def tor_response(*args, **kwargs):  # pylint: disable=unused-argument
+            started.set()
+            await asyncio.Event().wait()
+
+        network = Network(using_tor_proxy=True)
+        try:
+            with (
+                patch.dict(Network._TOR_CHECK_RESULT, {}, clear=True),
+                patch('searx.network.network.new_client', return_value=client),
+                patch.object(httpx.AsyncClient, 'get', new=tor_response),
+            ):
+                create_task = asyncio.create_task(network.get_client())
+                await started.wait()
+                create_task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await create_task
+            await network.aclose()
+            self.assertTrue(client.is_closed, 'unpublished client leaked after cancellation')
+        finally:
+            await client.aclose()
+
+    async def test_partial_group_close_failure_quarantines_every_old_network(self):
+        first, second = Network(), Network()
+        clients = [await first.get_client(), await second.get_client()]
+        original_close = httpx.AsyncClient.aclose
+
+        async def close(client):
+            if client is clients[1]:
+                raise httpx.CloseError('synthetic close fault')
+            await original_close(client)
+
+        try:
+            with patch.object(httpx.AsyncClient, 'aclose', new=close):
+                with self.assertRaises(httpx.CloseError):
+                    await Network.aclose_all([first, second])
+            self.assertTrue(clients[0].is_closed)
+            for network in (first, second):
+                with self.assertRaises(RuntimeError):
+                    await network.get_client()
+        finally:
+            for client in clients:
+                await original_close(client)
+
+    async def test_cancelled_drain_does_not_reopen_old_generation(self):
+        network = Network()
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def request(client, *args, **kwargs):  # pylint: disable=unused-argument
+            started.set()
+            await release.wait()
+            return httpx.Response(200, text='complete')
+
+        with patch.object(httpx.AsyncClient, 'request', new=request):
+            request_task = asyncio.create_task(network.request('GET', 'https://example.com/'))
+            await started.wait()
+            close_task = asyncio.create_task(network.aclose())
+            await asyncio.sleep(0)
+            close_task.cancel()
+            try:
+                with self.assertRaises(asyncio.CancelledError):
+                    await close_task
+                with self.assertRaises(RuntimeError):
+                    await network.get_client()
+            finally:
+                release.set()
+                await request_task
+                await network.aclose()
+
+    async def test_concurrent_tor_client_validation_keeps_one_owned_client(self):
+        started, release = asyncio.Event(), asyncio.Event()
+        clients = []
+
+        async def tor_response(client, *args, **kwargs):  # pylint: disable=unused-argument
+            clients.append(client)
+            started.set()
+            await release.wait()
+            return httpx.Response(200, json={'IsTor': True})
+
+        network = Network(using_tor_proxy=True)
+        with (
+            patch.dict(Network._TOR_CHECK_RESULT, {}, clear=True),
+            patch.object(httpx.AsyncClient, 'get', new=tor_response),
+        ):
+            first = asyncio.create_task(network.get_client())
+            await started.wait()
+            second = asyncio.create_task(network.get_client())
+            await asyncio.sleep(0)
+            release.set()
+            first_client, second_client = await asyncio.gather(first, second)
+        try:
+            self.assertIs(first_client, second_client, 'concurrent validation replaced an owned client')
+            self.assertEqual(len(clients), 1)
+        finally:
+            await network.aclose()
+            for client in clients:
+                await client.aclose()
+
+    async def test_aclose_clears_client_pool(self):
+        network = Network()
+        client = await network.get_client()
+
+        await network.aclose()
+
+        self.assertTrue(client.is_closed)
+        self.assertEqual(network._clients, {})
 
 
 class TestNetwork(SearxTestCase):
@@ -39,43 +263,6 @@ class TestNetwork(SearxTestCase):
             initialize(settings_engines=list(settings['engines']), settings_outgoing=outgoing)
 
         self.assertIs(NETWORKS['__DEFAULT__'], old_default)
-
-    async def test_aclose_waits_for_inflight_request_before_closing_generation(self):
-        import asyncio
-
-        started = asyncio.Event()
-        release = asyncio.Event()
-
-        async def request(*args, **kwargs):  # pylint: disable=unused-argument
-            started.set()
-            await release.wait()
-            return httpx.Response(200)
-
-        network = Network(enable_http=True)
-        with patch.object(httpx.AsyncClient, 'request', new=request):
-            request_task = asyncio.create_task(network.request('GET', 'https://example.com/'))
-            await started.wait()
-            client = next(iter(network._clients.values()))
-            close_task = asyncio.create_task(network.aclose())
-            await asyncio.sleep(0)
-            self.assertFalse(client.is_closed)
-            release.set()
-            await request_task
-            await close_task
-
-        self.assertTrue(client.is_closed)
-        self.assertEqual(network._clients, {})
-        with self.assertRaises(RuntimeError):
-            await network.get_client()
-
-    async def test_aclose_clears_client_pool(self):
-        network = Network()
-        client = await network.get_client()
-
-        await network.aclose()
-
-        self.assertTrue(client.is_closed)
-        self.assertEqual(network._clients, {})
 
     def test_ipaddress_cycle(self):
         network = NETWORKS['ipv6']
@@ -310,6 +497,11 @@ class TestNetworkStreamRetries(SearxTestCase):
 
     TEXT = 'Lorem Ipsum'
 
+    @staticmethod
+    @asynccontextmanager
+    async def response_context(response):
+        yield response
+
     def setUp(self):
         self.init_test_settings()
 
@@ -322,22 +514,23 @@ class TestNetworkStreamRetries(SearxTestCase):
             if first:
                 first = False
                 raise httpx.RequestError('fake exception', request=None)
-            return httpx.Response(status_code=200, text=TestNetworkStreamRetries.TEXT)
+            return cls.response_context(httpx.Response(status_code=200, text=cls.TEXT))
 
         return stream
 
     async def test_retries_ok(self):
         with patch.object(httpx.AsyncClient, 'stream', new=TestNetworkStreamRetries.get_response_exception_then_200()):
             network = Network(enable_http=True, retries=1, retry_on_http_error=403)
-            response = await network.stream('GET', 'https://example.com/')
-            self.assertEqual(response.text, TestNetworkStreamRetries.TEXT)
+            async with await network.stream('GET', 'https://example.com/') as response:
+                self.assertEqual(response.text, TestNetworkStreamRetries.TEXT)
             await network.aclose()
 
     async def test_retries_fail(self):
         with patch.object(httpx.AsyncClient, 'stream', new=TestNetworkStreamRetries.get_response_exception_then_200()):
             network = Network(enable_http=True, retries=0, retry_on_http_error=403)
             with self.assertRaises(httpx.RequestError):
-                await network.stream('GET', 'https://example.com/')
+                async with await network.stream('GET', 'https://example.com/'):
+                    self.fail('stream unexpectedly opened')
             await network.aclose()
 
     async def test_retries_exception(self):
@@ -347,11 +540,11 @@ class TestNetworkStreamRetries(SearxTestCase):
             nonlocal first
             if first:
                 first = False
-                return httpx.Response(status_code=403, text=TestNetworkRequestRetries.TEXT)
-            return httpx.Response(status_code=200, text=TestNetworkRequestRetries.TEXT)
+                return self.response_context(httpx.Response(status_code=403, text=self.TEXT))
+            return self.response_context(httpx.Response(status_code=200, text=self.TEXT))
 
         with patch.object(httpx.AsyncClient, 'stream', new=stream):
             network = Network(enable_http=True, retries=0, retry_on_http_error=403)
-            response = await network.stream('GET', 'https://example.com/', raise_for_httperror=False)
-            self.assertEqual(response.status_code, 403)
+            async with await network.stream('GET', 'https://example.com/', raise_for_httperror=False) as response:
+                self.assertEqual(response.status_code, 403)
             await network.aclose()

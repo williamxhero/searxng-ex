@@ -6,11 +6,13 @@ __all__ = ["get_network"]
 
 import typing as t
 from collections.abc import Generator
+from contextlib import asynccontextmanager, contextmanager
 
 
 import atexit
 import asyncio
 import ipaddress
+import threading
 from itertools import cycle
 
 import httpx
@@ -24,6 +26,8 @@ from .raise_for_httperror import raise_for_httperror
 logger = logger.getChild('network')
 DEFAULT_NAME = '__DEFAULT__'
 NETWORKS: dict[str, "Network"] = {}
+_INITIALIZE_LOCK = threading.Lock()
+_REGISTRY_LOCK = threading.Lock()
 # requests compatibility when reading proxy settings from settings.yml
 PROXY_PATTERN_MAPPING = {
     'http': 'http://',
@@ -39,6 +43,37 @@ PROXY_PATTERN_MAPPING = {
 }
 
 ADDRESS_MAPPING = {'ipv4': '0.0.0.0', 'ipv6': '::'}
+
+
+class _NetworkLifecycle:
+    """Admission and drain state, owned exclusively by the HTTP event loop."""
+
+    def __init__(self):
+        self.tasks = {}
+        self.idle = asyncio.Event()
+        self.idle.set()
+        self.draining = False
+        self.close_lock = asyncio.Lock()
+        self.client_lock = asyncio.Lock()
+
+    def begin_drain(self):
+        self.draining = True
+
+    @contextmanager
+    def lease(self):
+        task = asyncio.current_task()
+        if self.draining and task not in self.tasks:
+            raise RuntimeError('network generation is draining')
+        self.tasks[task] = self.tasks.get(task, 0) + 1
+        self.idle.clear()
+        try:
+            yield
+        finally:
+            self.tasks[task] -= 1
+            if not self.tasks[task]:
+                del self.tasks[task]
+            if not self.tasks:
+                self.idle.set()
 
 
 @t.final
@@ -60,10 +95,7 @@ class Network:
         '_local_addresses_cycle',
         '_proxies_cycle',
         '_clients',
-        '_active_requests',
-        '_drain_event',
-        '_draining',
-        '_managed',
+        '_lifecycle',
         '_logger',
         'protected',
     )
@@ -105,11 +137,7 @@ class Network:
         self._local_addresses_cycle = self.get_ipaddress_cycle()
         self._proxies_cycle = self.get_proxy_cycles()
         self._clients = {}
-        self._active_requests = 0
-        self._drain_event = asyncio.Event()
-        self._drain_event.set()
-        self._draining = False
-        self._managed = False
+        self._lifecycle = _NetworkLifecycle()
         self._logger = logger.getChild(logger_name) if logger_name else logger
         self.check_parameters()
 
@@ -207,8 +235,11 @@ class Network:
         return result
 
     async def get_client(self, verify: bool | None = None, max_redirects: int | None = None) -> httpx.AsyncClient:
-        if self._draining or (self._managed and not any(network is self for network in NETWORKS.values())):
-            raise RuntimeError('network generation is draining')
+        with self._lifecycle.lease():
+            async with self._lifecycle.client_lock:
+                return await self._get_client(verify, max_redirects)
+
+    async def _get_client(self, verify, max_redirects):
         if self.protected and self.using_tor_proxy:
             from wag_protection import ProtectionError  # pylint: disable=import-outside-toplevel
 
@@ -245,28 +276,33 @@ class Network:
                 hook_log_response,
                 protected=self.protected,
             )
-            if self.using_tor_proxy and not await self.check_tor_proxy(client, proxies):
-                await client.aclose()
-                raise httpx.ProxyError('Network configuration problem: not using Tor')
+            try:
+                if self.using_tor_proxy and not await self.check_tor_proxy(client, proxies):
+                    raise httpx.ProxyError('Network configuration problem: not using Tor')
+            except BaseException:
+                # Keep ownership even if cancellation or client cleanup also fails.
+                self._clients[key] = client
+                try:
+                    await client.aclose()
+                except BaseException:
+                    self._lifecycle.begin_drain()
+                    raise
+                raise
             self._clients[key] = client
         return self._clients[key]
 
     async def aclose(self):
-        self._draining = True
-        try:
-            await self._drain_event.wait()
-
-            async def close_client(client):
-                try:
-                    await client.aclose()
-                except httpx.HTTPError:
-                    pass
-
-            await asyncio.gather(*[close_client(client) for client in self._clients.values()], return_exceptions=False)
-        except BaseException:
-            self._draining = False
-            raise
-        self._clients.clear()
+        # Retirement is irreversible, including cancellation/partial close failure.
+        self._lifecycle.begin_drain()
+        async with self._lifecycle.close_lock:
+            await self._lifecycle.idle.wait()
+            results = await asyncio.gather(
+                *[client.aclose() for client in self._clients.values()], return_exceptions=True
+            )
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
+            self._clients.clear()
 
     @staticmethod
     def extract_kwargs_clients(kwargs: dict[str, t.Any]) -> dict[str, t.Any]:
@@ -338,16 +374,10 @@ class Network:
         return response
 
     async def call_client(self, stream: bool, method: str, url: str, **kwargs: t.Any) -> SXNG_Response:
-        if self._draining or (self._managed and not any(network is self for network in NETWORKS.values())):
-            raise RuntimeError('network generation is draining')
-        self._active_requests += 1
-        self._drain_event.clear()
-        try:
-            return await self._call_client(stream, method, url, **kwargs)
-        finally:
-            self._active_requests -= 1
-            if self._active_requests == 0:
-                self._drain_event.set()
+        if stream:
+            return self._stream_context(method, url, **kwargs)
+        with self._lifecycle.lease():
+            return await self._call_client(False, method, url, **kwargs)
 
     async def _call_client(self, stream: bool, method: str, url: str, **kwargs: t.Any) -> SXNG_Response:
         if self.protected:
@@ -385,17 +415,32 @@ class Network:
     async def request(self, method: str, url: str, **kwargs: t.Any) -> SXNG_Response:
         return await self.call_client(False, method, url, **kwargs)
 
+    @asynccontextmanager
+    async def _stream_context(self, method: str, url: str, **kwargs):
+        with self._lifecycle.lease():
+            async with await self._call_client(True, method, url, **kwargs) as response:
+                yield response
+
     async def stream(self, method: str, url: str, **kwargs):
         return await self.call_client(True, method, url, **kwargs)
 
     @classmethod
     async def aclose_all(cls, networks=None):
+        # pylint: disable=protected-access
         networks = list(dict.fromkeys(NETWORKS.values() if networks is None else networks))
-        await asyncio.gather(*[network.aclose() for network in networks], return_exceptions=False)
+        # Close admission across the whole generation before the first await.
+        for network in networks:
+            network._lifecycle.begin_drain()
+        await asyncio.gather(*[network._lifecycle.idle.wait() for network in networks])
+        results = await asyncio.gather(*[network.aclose() for network in networks], return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
 
 
 def get_network(name: str | None = None) -> "Network":
-    return NETWORKS.get(name or DEFAULT_NAME)  # pyright: ignore[reportReturnType]
+    with _REGISTRY_LOCK:
+        return NETWORKS.get(name or DEFAULT_NAME)  # pyright: ignore[reportReturnType]
 
 
 def check_network_configuration():
@@ -420,6 +465,12 @@ def initialize(
     settings_engines: list[dict[str, t.Any]] = None,  # pyright: ignore[reportArgumentType]
     settings_outgoing: dict[str, t.Any] = None,  # pyright: ignore[reportArgumentType]
 ) -> None:
+    # Serialize reloads without holding the short registry lock across draining.
+    with _INITIALIZE_LOCK:
+        _initialize(settings_engines, settings_outgoing)
+
+
+def _initialize(settings_engines, settings_outgoing):
     # pylint: disable=import-outside-toplevel)
     from searx.engines import engines
     from searx import settings
@@ -508,10 +559,10 @@ def initialize(
     old_networks = list(dict.fromkeys(NETWORKS.values()))
     if old_networks:
         _close_network_generation(old_networks)
+    # Old references remain permanently retired. Readers see one complete map.
+    with _REGISTRY_LOCK:
         NETWORKS.clear()
-    NETWORKS.update(new_networks)
-    for network in dict.fromkeys(new_networks.values()):
-        network._managed = True  # pylint: disable=protected-access
+        NETWORKS.update(new_networks)
 
 
 def _close_network_generation(networks):
@@ -526,8 +577,6 @@ def _close_network_generation(networks):
             raise
     else:
         asyncio.run(Network.aclose_all(networks))
-    for network in networks:
-        network._draining = False  # pylint: disable=protected-access
 
 
 @atexit.register
@@ -540,12 +589,13 @@ def done():
     Note: since Network.aclose has to be async, it is not possible to call this method on Network.__del__
     So Network.aclose is called here using atexit.register
     """
-    networks = list(dict.fromkeys(NETWORKS.values()))
-    try:
-        _close_network_generation(networks)
-    finally:
-        NETWORKS.clear()
+    with _INITIALIZE_LOCK:
+        networks = list(dict.fromkeys(NETWORKS.values()))
+        try:
+            _close_network_generation(networks)
+        finally:
+            with _REGISTRY_LOCK:
+                NETWORKS.clear()
 
 
 NETWORKS[DEFAULT_NAME] = Network()
-NETWORKS[DEFAULT_NAME]._managed = True  # pylint: disable=protected-access
