@@ -455,6 +455,54 @@ class ProtectedTransportTest(unittest.TestCase):  # pylint: disable=too-many-pub
         self.assertEqual((root / 'ledger.sqlite').read_bytes(), before)
         self.assertEqual(self.tls_server.headers, 0)
 
+    def test_config_refuses_shadow_loaded_native_module_without_storage_or_send(self):
+        import importlib.util
+        import sys
+        import searx.webapp
+        import searx.network.protected as native
+
+        _, root, _ = self.native_search_fixture()
+        before = (root / 'ledger.sqlite').read_bytes()
+        shadow_path = Path(self.parent.name) / 'shadow-protected.py'
+        shadow_path.write_bytes(Path(native.__file__).read_bytes())
+        qualified = 'searx.network.protected'
+        spec = importlib.util.spec_from_file_location(qualified, shadow_path)
+        assert spec is not None and spec.loader is not None
+        shadow = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(shadow)
+        for claimed_file in (str(shadow_path), native.__file__):
+            with self.subTest(claimed_file=claimed_file), patch.dict(sys.modules, {qualified: shadow}):
+                # A __file__ claim alone is not evidence of the actual import origin.
+                shadow.__file__ = claimed_file
+                response = searx.webapp.app.test_client().get('/config')
+                self.assertEqual(response.status_code, 200)
+                descriptor = response.get_json()['outbound_protection']
+                self.assertEqual((descriptor['admission'], descriptor['reason']), ('blocked', 'provenance_error'))
+                self.assertEqual((root / 'ledger.sqlite').read_bytes(), before)
+                self.assertEqual(self.tls_server.headers, 0)
+
+    def test_config_refuses_external_native_package_search_paths_before_send(self):
+        import searx
+        import searx.network
+        import searx.webapp
+
+        _, root, _ = self.native_search_fixture()
+        before = (root / 'ledger.sqlite').read_bytes()
+        external = Path(self.parent.name) / 'external-package'
+        external.mkdir()
+        for package in (searx, searx.network):
+            for target, attribute in ((package, '__path__'), (package.__spec__, 'submodule_search_locations')):
+                with (
+                    self.subTest(package=package.__name__, attribute=attribute),
+                    patch.object(target, attribute, [str(external), *getattr(target, attribute)]),
+                ):
+                    response = searx.webapp.app.test_client().get('/config')
+                    self.assertEqual(response.status_code, 200)
+                    descriptor = response.get_json()['outbound_protection']
+                    self.assertEqual((descriptor['admission'], descriptor['reason']), ('blocked', 'provenance_error'))
+                    self.assertEqual((root / 'ledger.sqlite').read_bytes(), before)
+                    self.assertEqual(self.tls_server.headers, 0)
+
     def test_transport_rejects_incompatible_dependency_versions_before_connect(self):
         import httpcore
         import httpx

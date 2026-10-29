@@ -484,6 +484,40 @@ def _validate_dependency_provenance(distributions, wheels, files, mode):
         raise ValueError('incomplete dependency provenance')
 
 
+def _validate_loaded_sources(module_root, files):
+    # Do not import native modules here: the core also serves standalone callers.
+    # Bind loaded parents too: their search paths control future native imports.
+    loaded = sys.modules.copy()
+    sources = {}
+    packages = set()
+    for name in files:
+        relative = Path(name)
+        if relative.suffix != '.py' or relative.parts[0] not in ('searx', 'wag_protection'):
+            continue
+        parts = relative.parts[:-1] if relative.name == '__init__.py' else (*relative.parts[:-1], relative.stem)
+        sources['.'.join(parts)] = module_root / relative
+        for length in range(1, len(relative.parts)):
+            parent = relative.parts[:length]
+            package = '.'.join(parent)
+            sources[package] = module_root.joinpath(*parent, '__init__.py')
+            packages.add(package)
+    for name, expected in sources.items():
+        module = loaded.get(name)
+        if module is None:
+            continue
+        origin = getattr(module, '__file__', None)
+        spec = getattr(module, '__spec__', None)
+        spec_origin = getattr(spec, 'origin', None)
+        if (not isinstance(origin, str) or canonical_path(origin) != expected
+                or not isinstance(spec_origin, str) or canonical_path(spec_origin) != expected):
+            raise ValueError('shadow native module')
+        if name in packages:
+            for paths in (getattr(module, '__path__', None), getattr(spec, 'submodule_search_locations', None)):
+                if (not isinstance(paths, (list, tuple)) or len(paths) != 1
+                        or not isinstance(paths[0], str) or canonical_path(paths[0]) != expected.parent):
+                    raise ValueError('shadow native package')
+
+
 def validate_manifest(manifest, root, mode):
     if not isinstance(manifest, dict):
         path = canonical_path(manifest)
@@ -545,6 +579,7 @@ def validate_manifest(manifest, root, mode):
     )
     if any(name not in files for name in required_files):
         raise ValueError('missing native artifact file')
+    _validate_loaded_sources(module_root, files)
     _validate_dependency_provenance(manifest['distributions'], manifest['wheels'], files, mode)
     registry = validate_registry(manifest['registry'])
     if json_digest(registry) != manifest['registry_digest']:
