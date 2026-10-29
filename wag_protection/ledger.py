@@ -36,7 +36,8 @@ SCHEMA = """
 CREATE TABLE state (id TEXT PRIMARY KEY, root TEXT NOT NULL, checkpoint TEXT NOT NULL);
 CREATE TABLE contract_meta (
  singleton INTEGER PRIMARY KEY CHECK(singleton=1), version INTEGER NOT NULL CHECK(version=2),
- registry_digest TEXT NOT NULL, migration_wall REAL NOT NULL, migration_mono REAL NOT NULL, migration_boot TEXT NOT NULL);
+ registry_digest TEXT NOT NULL, migration_wall REAL NOT NULL, migration_mono REAL NOT NULL,
+ migration_boot TEXT NOT NULL);
 CREATE TABLE engine_identities (
  engine TEXT PRIMARY KEY, domestic INTEGER NOT NULL CHECK(domestic IN (0,1)), module TEXT NOT NULL,
  capability TEXT NOT NULL CHECK(capability='online_one_send'), source_digest TEXT NOT NULL, profile_json TEXT NOT NULL);
@@ -53,7 +54,8 @@ CREATE INDEX attempts_engine_account ON attempts(engine,account_boot,account_mon
 CREATE INDEX attempts_domestic_account ON attempts(domestic,account_boot,account_mono);
 CREATE INDEX attempts_dispatch ON attempts(dispatch_id);
 CREATE TABLE pauses (
- engine TEXT PRIMARY KEY REFERENCES engine_identities(engine), strikes INTEGER NOT NULL CHECK(strikes>=0), until REAL NOT NULL);
+ engine TEXT PRIMARY KEY REFERENCES engine_identities(engine), strikes INTEGER NOT NULL CHECK(strikes>=0),
+ until REAL NOT NULL);
 CREATE TABLE poison (reason TEXT NOT NULL);
 CREATE TABLE release_checks (
  release_id TEXT PRIMARY KEY, artifact_digest TEXT NOT NULL, config_digest TEXT NOT NULL, boot TEXT NOT NULL,
@@ -64,10 +66,12 @@ CREATE TABLE recoveries (
  recovery_id INTEGER PRIMARY KEY, authorization TEXT NOT NULL, old_checkpoint TEXT NOT NULL,
  old_poison_json TEXT NOT NULL, new_boot TEXT NOT NULL, wall REAL NOT NULL, mono REAL NOT NULL, decision TEXT NOT NULL);
 CREATE TABLE recovery_attempts (
- recovery_id INTEGER NOT NULL REFERENCES recoveries(recovery_id), attempt_id INTEGER NOT NULL REFERENCES attempts(attempt_id),
+ recovery_id INTEGER NOT NULL REFERENCES recoveries(recovery_id),
+ attempt_id INTEGER NOT NULL REFERENCES attempts(attempt_id),
  old_row_json TEXT NOT NULL, PRIMARY KEY(recovery_id,attempt_id));
 CREATE TABLE recovery_pauses (
- recovery_id INTEGER NOT NULL REFERENCES recoveries(recovery_id), engine TEXT NOT NULL REFERENCES engine_identities(engine),
+ recovery_id INTEGER NOT NULL REFERENCES recoveries(recovery_id),
+ engine TEXT NOT NULL REFERENCES engine_identities(engine),
  old_strikes INTEGER NULL, old_until REAL NULL, PRIMARY KEY(recovery_id,engine));
 PRAGMA user_version=2;
 """
@@ -507,7 +511,11 @@ class Store:
         if pause and now['mono'] < pause[0]:
             raise ProtectionError('cooldown')
         args = (engine['engine'], now['boot'], now['mono'] - 60)
-        if db.execute('SELECT count(*) FROM attempts WHERE engine=? AND account_boot=? AND account_mono>?', args).fetchone()[0] >= 6:
+        if (
+            db.execute('SELECT count(*) FROM attempts WHERE engine=? AND account_boot=? AND account_mono>?', args)
+            .fetchone()[0]
+            >= 6
+        ):
             raise ProtectionError('engine_rate')
         if engine['domestic'] and db.execute(
             'SELECT count(*) FROM attempts WHERE domestic=1 AND account_boot=? AND account_mono>?',
@@ -529,6 +537,78 @@ class Store:
             return Refusal('storage_error')
         except (ValueError, TypeError, KeyError):
             return Refusal('schema_error')
+
+    @staticmethod
+    def _execute_engine(context, build, send, parse):
+        outcome = 'request_refused'
+        results = None
+        result_count = None
+        suspension_s = 0
+        try:
+            context.phase = 'build'
+            request = build()
+            context.check_deadline()
+            outcome = 'error'
+            context.phase = 'send'
+            response = send(context, request)
+            context.check_deadline()
+            outcome = 'parser_error'
+            context.phase = 'parse'
+            results = parse(response)
+            context.check_deadline()
+            result_count = len(results) if results is not None else 0
+            outcome = 'ok' if result_count else 'empty'
+        except EngineFailure as error:
+            outcome = error.outcome
+            suspension_s = error.suspension_s
+        except ProtectionError as error:
+            outcome = {'deadline_exceeded': 'timeout', 'capability_refused': 'runtime_error'}.get(
+                error.reason, error.reason
+            )
+            if outcome not in OUTCOMES:
+                outcome = 'error'
+        except Exception:  # callbacks may contain private request/response data
+            pass
+        return outcome, results, result_count, suspension_s
+
+    def _finish_engine(
+        self, db, context, entry, started, deadline_mono, observer, outcome, results, result_count, suspension_s
+    ):
+        if os.getpid() != self.pid:
+            raise ProtectionError('capability_refused')
+        finished = _clock()
+        if not _clock_matches(started, finished):
+            db.execute('INSERT INTO poison VALUES (?)', ('clock_error',))
+            _commit(db, self.root)
+            return Refusal('clock_error')
+        if context.unfinished or (observer is not None and (
+                observer.cancelled or (observer.cancellation_requested and finished['mono'] >= deadline_mono))):
+            return context.finish_unfinished()
+        db.execute(
+            'UPDATE attempts SET outcome=?,stamp=?,finished_mono=?,account_boot=?,account_mono=?,elapsed=? '
+            'WHERE dispatch_id=?',
+            (outcome, finished['mono'], finished['mono'], finished['boot'], finished['mono'],
+             finished['mono'] - started['mono'], context.dispatch_id),
+        )
+        if outcome in ('captcha', 'access_denied', 'rate_limited', 'challenge_unknown'):
+            previous = db.execute('SELECT strikes,until FROM pauses WHERE engine=?', (entry['engine'],)).fetchone()
+            strikes = (previous['strikes'] if previous else 0) + 1
+            until = max(previous['until'] if previous else 0,
+                        finished['mono'] + max(suspension_s, 1800 * 2 ** min(strikes - 1, 16)))
+            db.execute('INSERT OR REPLACE INTO pauses VALUES (?,?,?)', (entry['engine'], strikes, until))
+        elif outcome == 'ok' and result_count:
+            db.execute('DELETE FROM pauses WHERE engine=?', (entry['engine'],))
+        db.execute('UPDATE state SET checkpoint=?', (canonical_json(finished),))
+        _commit(db, self.root)
+        result = EngineOutcome(
+            entry['engine'], outcome, len(context.rows), context.connections, context.headers,
+            result_count, finished['mono'] - started['mono'], finished['mono'] >= deadline_mono, results,
+        )
+        if observer is not None and not observer._publish(result):
+            # Notification may arrive during the completion fsync. The worker
+            # still owns the flock and must persist uncertainty.
+            return context.finish_unfinished()
+        return result
 
     def run_engine(self, engine_name, *, caller, deadline_mono, build, send, parse, observer=None):
         if observer is not None:
@@ -553,63 +633,11 @@ class Store:
                 context = Dispatch(self, db, entry, caller, deadline_mono, now, observer)
                 context.reserve('engine_http')
                 token = CURRENT_DISPATCH.set(context)
-                outcome = 'request_refused'
-                results = None
-                result_count = None
-                suspension_s = 0
-                try:
-                    context.phase = 'build'
-                    request = build()
-                    context.check_deadline()
-                    outcome = 'error'
-                    context.phase = 'send'
-                    response = send(context, request)
-                    context.check_deadline()
-                    outcome = 'parser_error'
-                    context.phase = 'parse'
-                    results = parse(response)
-                    context.check_deadline()
-                    result_count = len(results) if results is not None else 0
-                    outcome = 'ok' if result_count else 'empty'
-                except EngineFailure as error:
-                    outcome = error.outcome
-                    suspension_s = error.suspension_s
-                except ProtectionError as error:
-                    outcome = {'deadline_exceeded': 'timeout', 'capability_refused': 'runtime_error'}.get(error.reason, error.reason)
-                    if outcome not in OUTCOMES:
-                        outcome = 'error'
-                except Exception:  # callbacks may contain private request/response data
-                    pass
-                if os.getpid() != self.pid:
-                    raise ProtectionError('capability_refused')
-                finished = _clock()
-                if not _clock_matches(now, finished):
-                    db.execute('INSERT INTO poison VALUES (?)', ('clock_error',))
-                    _commit(db, self.root)
-                    return Refusal('clock_error')
-                if context.unfinished or (observer is not None and (
-                        observer.cancelled or (observer.cancellation_requested and finished['mono'] >= deadline_mono))):
-                    return context.finish_unfinished()
-                db.execute('UPDATE attempts SET outcome=?,stamp=?,finished_mono=?,account_boot=?,account_mono=?,elapsed=? WHERE dispatch_id=?',
-                           (outcome, finished['mono'], finished['mono'], finished['boot'], finished['mono'],
-                            finished['mono'] - now['mono'], context.dispatch_id))
-                if outcome in ('captcha', 'access_denied', 'rate_limited', 'challenge_unknown'):
-                    previous = db.execute('SELECT strikes,until FROM pauses WHERE engine=?', (entry['engine'],)).fetchone()
-                    strikes = (previous['strikes'] if previous else 0) + 1
-                    until = max(previous['until'] if previous else 0,
-                                finished['mono'] + max(suspension_s, 1800 * 2 ** min(strikes - 1, 16)))
-                    db.execute('INSERT OR REPLACE INTO pauses VALUES (?,?,?)', (entry['engine'], strikes, until))
-                elif outcome == 'ok' and result_count:
-                    db.execute('DELETE FROM pauses WHERE engine=?', (entry['engine'],))
-                db.execute('UPDATE state SET checkpoint=?', (canonical_json(finished),))
-                _commit(db, self.root)
-                result = EngineOutcome(entry['engine'], outcome, len(context.rows), context.connections, context.headers,
-                                       result_count, finished['mono'] - now['mono'], finished['mono'] >= deadline_mono, results)
-                if observer is not None and not observer._publish(result):
-                    # Notification may arrive during the completion fsync. The
-                    # worker still owns the flock and must persist uncertainty.
-                    return context.finish_unfinished()
-                return result
+                outcome, results, result_count, suspension_s = self._execute_engine(context, build, send, parse)
+                return self._finish_engine(
+                    db, context, entry, now, deadline_mono, observer,
+                    outcome, results, result_count, suspension_s,
+                )
         except ProtectionError as error:
             return Refusal(error.reason)
         except (OSError, sqlite3.Error):
@@ -646,8 +674,10 @@ class Store:
                     return Refusal('deadline_exceeded')
                 if db.execute('SELECT 1 FROM release_checks WHERE release_id=?', (release_id,)).fetchone():
                     return Refusal('release_consumed')
-                db.execute('INSERT INTO release_checks VALUES (?,?,?,?,?,?,?,0,NULL,NULL)',
-                           (release_id, artifact_digest, config_digest, now['boot'], now['mono'], deadline_mono, 'claimed'))
+                db.execute(
+                    'INSERT INTO release_checks VALUES (?,?,?,?,?,?,?,0,NULL,NULL)',
+                    (release_id, artifact_digest, config_digest, now['boot'], now['mono'], deadline_mono, 'claimed'),
+                )
                 db.execute('UPDATE state SET checkpoint=?', (canonical_json(now),))
                 _commit(db, self.root)
                 return ReleaseReceipt(self, release_id, artifact_digest, config_digest)
@@ -719,8 +749,12 @@ class Store:
             with self._locked(readonly=True) as db:
                 now = _clock()
                 self._admit(db, now, persist_clock=False)
-                if (artifact_digest != self.manifest['artifact_digest'] or config_digest != self.manifest['config_digest']
-                        or not finite(max_age_s) or max_age_s > 60):
+                if (
+                    artifact_digest != self.manifest['artifact_digest']
+                    or config_digest != self.manifest['config_digest']
+                    or not finite(max_age_s)
+                    or max_age_s > 60
+                ):
                     return Refusal('provenance_error')
                 row = db.execute('''SELECT * FROM release_checks WHERE artifact_digest=? AND config_digest=?
                     ORDER BY claimed_mono DESC,rowid DESC LIMIT 1''', (artifact_digest, config_digest)).fetchone()
@@ -1018,8 +1052,15 @@ class _SyntheticMaintenanceSession:
             if int(birth[1]) != self._pid:
                 raise ProtectionError('evidence_unknown')
             start_ticks = int(birth[19])
-            process.stdin.write(canonical_json({'root': str(self._store.root), 'manifest': load_json(self._manifest_json),
-                                               'engine': engine, 'clock': _clock()}) + '\n')
+            process.stdin.write(
+                canonical_json({
+                    'root': str(self._store.root),
+                    'manifest': load_json(self._manifest_json),
+                    'engine': engine,
+                    'clock': _clock(),
+                })
+                + '\n'
+            )
             process.stdin.flush()
             if not select.select([process.stdout], [], [], 5)[0]:
                 raise ProtectionError('evidence_unknown')
@@ -1084,7 +1125,10 @@ class _SyntheticMaintenanceSession:
         bindings = tuple(registered)
         ids = tuple(attempt_id for binding in bindings for attempt_id in binding.attempt_ids)
         with self._store._locked(readonly=True) as db:
-            unknown = tuple(row[0] for row in db.execute('SELECT attempt_id FROM attempts WHERE outcome IS NULL ORDER BY attempt_id'))
+            unknown = tuple(
+                row[0]
+                for row in db.execute('SELECT attempt_id FROM attempts WHERE outcome IS NULL ORDER BY attempt_id')
+            )
             if len(ids) > 64 or len(ids) != len(set(ids)) or tuple(sorted(ids)) != unknown:
                 raise ProtectionError('evidence_unknown')
             if self._files != _recovery_files(self._store):
@@ -1142,8 +1186,13 @@ def _recovery_witness(root, authorization, decision, proof):
             or len(proof.sender_bindings) != len(session._records)):
         raise ProtectionError('evidence_unknown')
     for binding, record in zip(proof.sender_bindings, session._records):
-        if (type(binding) is not SenderBinding or record['binding'] is not binding or binding._issuance is not _MAINTENANCE_TOKEN
-                or binding.boot != now['boot'] or not record['reaped'] or record['pidfd'] is None
+        if (
+            type(binding) is not SenderBinding
+            or record['binding'] is not binding
+            or binding._issuance is not _MAINTENANCE_TOKEN
+            or binding.boot != now['boot']
+            or not record['reaped']
+            or record['pidfd'] is None
                 or not select.select([record['pidfd']], [], [], 0)[0]):
             raise ProtectionError('evidence_unknown')
     approved = validate_manifest(load_json(session._manifest_json), root, 'synthetic')
@@ -1223,7 +1272,10 @@ def recover(root, *, authorization, decision, proof) -> RecoveryResult | Refusal
                     db.execute('UPDATE attempts SET account_boot=?,account_mono=? WHERE attempt_id=?',
                                (now['boot'], now['mono'], row['attempt_id']))
                 if row['outcome'] is None:
-                    db.execute('UPDATE attempts SET outcome=? WHERE attempt_id=?', ('unknown_terminated', row['attempt_id']))
+                    db.execute(
+                        'UPDATE attempts SET outcome=? WHERE attempt_id=?',
+                        ('unknown_terminated', row['attempt_id']),
+                    )
             for engine, (strikes, until) in pause_plan.items():
                 db.execute('INSERT OR REPLACE INTO pauses VALUES (?,?,?)', (engine, strikes, until))
             db.execute('UPDATE state SET checkpoint=?', (canonical_json(now),))

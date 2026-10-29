@@ -1108,8 +1108,11 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
     binding = session.start_sender('quark')
     session.stop_sender(binding)
     with sqlite3.connect(root / 'ledger.sqlite') as db:
-        db.execute('UPDATE state SET checkpoint=?', (json.dumps({'wall': 9000.0, 'mono': 80.0, 'boot': 'synthetic-old-boot'},
-                   sort_keys=True, separators=(',', ':')),))
+        db.execute(
+            'UPDATE state SET checkpoint=?',
+            (json.dumps({'wall': 9000.0, 'mono': 80.0, 'boot': 'synthetic-old-boot'},
+                        sort_keys=True, separators=(',', ':')),),
+        )
         db.execute('UPDATE attempts SET account_boot=?,account_mono=?', ('synthetic-old-boot', 90.0))
         db.execute('UPDATE attempts SET connection_attempted=NULL,http_attempted=NULL WHERE outcome IS NULL')
         db.executemany('INSERT INTO poison(rowid,reason) VALUES (?,?)', [
@@ -1135,7 +1138,9 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
             kwargs['factory'] = ObservedConnection
         return original_connect(database, *args, **kwargs)
     sqlite3.connect = connect
-    result = wag_protection.recover(root, authorization='synthetic:stage11-commit-death', decision='combined', proof=proof)
+    result = wag_protection.recover(
+        root, authorization='synthetic:stage11-commit-death', decision='combined', proof=proof
+    )
     print(json.dumps({'reason': getattr(result, 'reason', None)}), flush=True)
 '''
         for stage in ('before', 'after'):
