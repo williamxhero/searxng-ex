@@ -67,6 +67,7 @@ jobs:
           PYTHONDONTWRITEBYTECODE: "1"
           WAG_EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
           MOZ_ALLOW_ROOT: "1"
+          MOZ_DISABLE_CONTENT_SANDBOX: "1"
         run: |
           mkdir -p "$TMPDIR"
           if unshare --user --map-user=0 --map-group=1000 --net -- true 2>/dev/null; then
@@ -78,6 +79,7 @@ jobs:
               "PYTHONDONTWRITEBYTECODE=$PYTHONDONTWRITEBYTECODE" \
               "WAG_EXPECTED_HEAD=$WAG_EXPECTED_HEAD" \
               "MOZ_ALLOW_ROOT=$MOZ_ALLOW_ROOT" \
+              "MOZ_DISABLE_CONTENT_SANDBOX=$MOZ_DISABLE_CONTENT_SANDBOX" \
               "PATH=$PATH" \
               unshare --net -- \
               setpriv --reuid 0 --regid 1000 --clear-groups -- \
@@ -111,6 +113,7 @@ jobs:
           PYTHONDONTWRITEBYTECODE: "1"
           WAG_EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
           MOZ_ALLOW_ROOT: "1"
+          MOZ_DISABLE_CONTENT_SANDBOX: "1"
         run: |
           mkdir -p "$TMPDIR"
           set -o pipefail
@@ -124,6 +127,7 @@ jobs:
               "PYTHONDONTWRITEBYTECODE=$PYTHONDONTWRITEBYTECODE" \
               "WAG_EXPECTED_HEAD=$WAG_EXPECTED_HEAD" \
               "MOZ_ALLOW_ROOT=$MOZ_ALLOW_ROOT" \
+              "MOZ_DISABLE_CONTENT_SANDBOX=$MOZ_DISABLE_CONTENT_SANDBOX" \
               "PATH=$PATH" \
               unshare --net -- \
               setpriv --reuid 0 --regid 1000 --clear-groups -- \
