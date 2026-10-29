@@ -181,20 +181,49 @@ def _fsync_root(root):
         os.close(fd)
 
 
-def _commit(db, root):
-    db.commit()
+# A completion marker is a durable admission barrier, not a replacement store.
+# It is removed only after the final outcomes and directory entries are durable.
+# A crash/error leaves it for explicit offline operator review; never auto-clear.
+_COMPLETION_PENDING = 'completion.pending'
+
+
+def _require_completion_clear(root):
     try:
+        (root / _COMPLETION_PENDING).lstat()
+    except FileNotFoundError:
+        return
+    raise ProtectionError('storage_error')
+
+
+def _commit(db, root, *, completion=False):
+    marker = root / _COMPLETION_PENDING
+    if completion:
+        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        # If preparing the marker fails, do not commit any pending final UPDATEs.
+        # Closing the connection leaves the previous durable NULL reservation.
         _fsync_root(root)
-    except OSError:
-        # The SQLite commit may already be visible even when the directory fsync
-        # fails.  Persist a fail-closed poison before surfacing the storage error.
+    try:
+        db.commit()
+        _fsync_root(root)
+    except (OSError, sqlite3.Error):
+        # Either commit or directory fsync may fail after SQLite made the write
+        # visible. Attempt poison, but retain the completion barrier regardless.
         try:
             db.execute('INSERT INTO poison VALUES (?)', ('storage_error',))
             db.commit()
             _fsync_root(root)
         except (OSError, sqlite3.Error):
-            db.rollback()
+            try:
+                db.rollback()
+            except sqlite3.Error:
+                pass  # Preserve the original storage error and durable barrier.
         raise
+    # The completion caller retains the marker through notification accounting;
+    # a cancelled publication may still need a durable unfinished transition.
 
 
 def _schema_signature(db, table_names=TABLES):
@@ -330,14 +359,14 @@ class DispatchNotification:
 
     def notify(self):
         self._check_pid()
-        # This mutex only arbitrates notification/publication. Neither side
-        # holds it during I/O or while waiting for the owning worker to stop.
+        # This mutex arbitrates notification/publication, including the final
+        # marker unlink. It never covers network I/O, DB commits or worker waits.
         with self._lock:
             if self._result is None:
                 self._cancelled.set()
             return self._result
 
-    def _publish(self, result, *, unfinished=False):
+    def _publish(self, result, *, unfinished=False, completion_marker=None):
         self._check_pid()
         if self._worker != threading.get_ident():
             raise ProtectionError('capability_refused')
@@ -345,6 +374,8 @@ class DispatchNotification:
             if not unfinished and (self.cancelled or (
                     self.cancellation_requested and getattr(result, 'outcome', None) != 'cancelled')):
                 return False
+            if completion_marker is not None:
+                completion_marker.unlink()
             self._result = result
             return True
 
@@ -383,6 +414,7 @@ class Store:
                 raise
             if os.fstat(fd).st_ino != (self.root / 'lock').stat().st_ino:
                 raise ProtectionError('identity_error')
+            _require_completion_clear(self.root)
             uri = 'file:' + quote(str(self.root / 'ledger.sqlite')) + ('?mode=ro' if readonly else '?mode=rw')
             db = sqlite3.connect(uri, uri=True, timeout=0, check_same_thread=False)
             db.row_factory = sqlite3.Row
@@ -581,6 +613,11 @@ class Store:
                 context.finish_unfinished()
                 raise
             outcome = {'deadline_exceeded': 'timeout', 'capability_refused': 'runtime_error'}[error.reason]
+        except (OSError, sqlite3.Error):
+            # Storage errors from send-adjacent reservations must not be treated
+            # as ordinary callback failures and then finalized as completed rows.
+            context.finish_unfinished()
+            raise
         except Exception:  # callbacks may contain private request/response data
             pass
         return outcome, results, result_count, suspension_s
@@ -613,15 +650,21 @@ class Store:
         elif outcome == 'ok' and result_count:
             db.execute('DELETE FROM pauses WHERE engine=?', (entry['engine'],))
         db.execute('UPDATE state SET checkpoint=?', (canonical_json(finished),))
-        _commit(db, self.root)
+        _commit(db, self.root, completion=True)
         result = EngineOutcome(
             entry['engine'], outcome, len(context.rows), context.connections, context.headers,
             result_count, finished['mono'] - started['mono'], finished['mono'] >= deadline_mono, results,
         )
-        if observer is not None and not observer._publish(result):
-            # Notification may arrive during the completion fsync. The worker
-            # still owns the flock and must persist uncertainty.
-            return context.finish_unfinished()
+        if observer is not None:
+            if not observer._publish(result, completion_marker=self.root / _COMPLETION_PENDING):
+                # Keep the marker until cancellation accounting is also durable.
+                unfinished = context.finish_unfinished()
+                (self.root / _COMPLETION_PENDING).unlink()
+                return unfinished
+        else:
+            # No removal fsync is needed for safety: a crash either restores the
+            # conservative marker or leaves the already-durable final outcome.
+            (self.root / _COMPLETION_PENDING).unlink()
         return result
 
     def run_engine(self, engine_name, *, caller, deadline_mono, build, send, parse, observer=None):

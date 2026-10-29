@@ -1263,6 +1263,454 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
                         process.kill()
                     process.communicate(timeout=5)
 
+    def _assert_storage_hold_after_reopen(self, root=None, manifest=None):
+        root = self.root if root is None else root
+        manifest = self.manifest if manifest is None else manifest
+        callbacks = []
+        reopened = self.api.open_store(root, manifest=manifest, mode='synthetic')
+        if not isinstance(reopened, self.api.Refusal):
+            reopened = reopened.run_engine(
+                'bing',
+                caller='native_search',
+                deadline_mono=self.now['mono'] + 3,
+                build=lambda: callbacks.append('build'),
+                send=lambda context, request: callbacks.append('send'),
+                parse=lambda response: callbacks.append('parse'),
+            )
+        self.assertIsInstance(reopened, self.api.Refusal)
+        self.assertIn(reopened.reason, ('storage_error', 'unfinished_attempt'))
+        self.assertEqual(callbacks, [], 'a fresh handle must not dispatch after uncertainty')
+
+    def test_final_fsync_and_poison_failure_refuse_after_reopen(self):
+        import stat
+
+        parsed = False
+        final_fsync_faults = []
+        poison_faults = []
+        real_connect = sqlite3.connect
+        real_fsync = os.fsync
+
+        class FaultConnection(sqlite3.Connection):  # pylint: disable=too-few-public-methods
+            def execute(self, sql, *args, **kwargs):
+                if parsed and sql.startswith('INSERT INTO poison'):
+                    poison_faults.append('insert')
+                    raise sqlite3.OperationalError('synthetic poison insert failure')
+                return super().execute(sql, *args, **kwargs)
+
+        def connect(database, *args, **kwargs):
+            if str(database).startswith('file:' + str(self.root / 'ledger.sqlite')):
+                kwargs['factory'] = FaultConnection
+            return real_connect(database, *args, **kwargs)
+
+        def fsync(descriptor):
+            if parsed and stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                with real_connect(self.root / 'ledger.sqlite') as check:
+                    completed = check.execute('SELECT count(*) FROM attempts WHERE outcome IS NOT NULL').fetchone()[0]
+                if completed:
+                    final_fsync_faults.append(completed)
+                    raise OSError('synthetic final completion directory fsync failure')
+            return real_fsync(descriptor)
+
+        def parse(_response):
+            nonlocal parsed
+            parsed = True
+            return ['nonempty result']
+
+        with patch('sqlite3.connect', side_effect=connect), patch('os.fsync', side_effect=fsync):
+            result = self.attempt(parse=parse)
+        self.assertEqual(final_fsync_faults, [1], 'fault must follow the real FINAL SQLite commit')
+        self.assertEqual(poison_faults, ['insert'])
+        self.assertIsInstance(result, self.api.Refusal)
+        self.assertEqual(result.reason, 'storage_error')
+        self._assert_storage_hold_after_reopen()
+
+    def test_sqlite_failure_during_additional_reservation_is_fatal_after_reopen(self):
+        reserving = False
+        faults = []
+        callbacks = []
+        real_connect = sqlite3.connect
+
+        class FaultConnection(sqlite3.Connection):  # pylint: disable=too-few-public-methods
+            def commit(self):
+                if reserving and not faults:
+                    faults.append('additional reservation commit')
+                    raise sqlite3.OperationalError('synthetic SQLite commit failure')
+                return super().commit()
+
+        def connect(database, *args, **kwargs):
+            if str(database).startswith('file:' + str(self.root / 'ledger.sqlite')):
+                kwargs['factory'] = FaultConnection
+            return real_connect(database, *args, **kwargs)
+
+        def send(context, _request):
+            nonlocal reserving
+            reserving = True
+            context.reserve('proxy_connect')
+            callbacks.append('additional send')
+
+        with patch('sqlite3.connect', side_effect=connect):
+            result = self.attempt(send=send, parse=lambda response: callbacks.append('parse'))
+        self.assertEqual(faults, ['additional reservation commit'])
+        self.assertEqual(callbacks, [])
+        self.assertIsInstance(result, self.api.Refusal)
+        self.assertEqual(result.reason, 'storage_error')
+        reopened = self.open()
+        if not isinstance(reopened, self.api.Refusal):
+            reopened = reopened.run_engine(
+                'bing',
+                caller='native_search',
+                deadline_mono=self.now['mono'] + 3,
+                build=lambda: callbacks.append('reopened build'),
+                send=lambda context, request: callbacks.append('reopened send'),
+                parse=lambda response: [],
+            )
+        self.assertIsInstance(reopened, self.api.Refusal)
+        self.assertIn(reopened.reason, ('storage_error', 'unfinished_attempt'))
+        self.assertEqual(callbacks, [])
+
+    def test_completion_marker_cleanup_failure_does_not_publish_observer_success(self):
+        real_unlink = Path.unlink
+        observer = self.api.DispatchNotification()
+        faults = []
+
+        def unlink(path, *args, **kwargs):
+            if path == self.root / 'completion.pending':
+                faults.append('marker cleanup')
+                raise OSError('synthetic completion marker unlink failure')
+            return real_unlink(path, *args, **kwargs)
+
+        store = self.open()
+        assert not isinstance(store, self.api.Refusal)
+        with patch.object(Path, 'unlink', new=unlink):
+            result = store.run_engine(
+                'bing',
+                caller='native_search',
+                deadline_mono=self.now['mono'] + 3,
+                build=lambda: None,
+                send=lambda context, request: None,
+                parse=lambda response: ['nonempty result'],
+                observer=observer,
+            )
+        self.assertEqual(faults, ['marker cleanup'])
+        self.assertIsInstance(result, self.api.Refusal)
+        self.assertEqual(result.reason, 'storage_error')
+        self.assertIsNone(observer.notify(), 'storage refusal leaked previously published success')
+        self._assert_storage_hold_after_reopen()
+
+    def test_final_storage_uncertainty_matrix_refuses_without_publishing_success(self):
+        cases = [
+            (final, poison)
+            for final in ('commit_before', 'commit_after', 'directory_fsync')
+            for poison in ('success', 'insert', 'commit', 'directory_fsync')
+        ]
+        for number, (final_fault, poison_fault) in enumerate(cases):
+            with self.subTest(final=final_fault, poison=poison_fault):
+                root = Path(self.parent.name) / f'completion-fault-{number}'
+                self._assert_final_storage_uncertainty(root, final_fault, poison_fault)
+
+    def _assert_final_storage_uncertainty(self, root, final_fault, poison_fault):
+        import stat
+
+        real_connect = sqlite3.connect
+        real_fsync = os.fsync
+        self.api.initialize_fixture(root, registry=self.engines, clock=lambda: dict(self.now))
+        manifest = fixture_manifest(root, self.engines)
+        parsed, failures, poison_events, callbacks = [], [], [], []
+
+        class FaultConnection(sqlite3.Connection):  # pylint: disable=too-few-public-methods
+            poisoning = False
+
+            def execute(self, sql, *args, **kwargs):
+                if sql.startswith('INSERT INTO poison') and failures:
+                    self.poisoning = True
+                    poison_events.append('insert')
+                    if poison_fault == 'insert':
+                        raise sqlite3.OperationalError('synthetic poison insert failure')
+                return super().execute(sql, *args, **kwargs)
+
+            def commit(self):
+                if self.poisoning:
+                    poison_events.append('commit')
+                    if poison_fault == 'commit':
+                        raise sqlite3.OperationalError('synthetic poison commit failure')
+                elif parsed and not failures and final_fault.startswith('commit_'):
+                    failures.append(final_fault)
+                    if final_fault == 'commit_after':
+                        super().commit()
+                    raise sqlite3.OperationalError('synthetic final SQLite commit failure')
+                return super().commit()
+
+        def connect(database, *args, **kwargs):
+            if str(database).startswith('file:' + str(root / 'ledger.sqlite')):
+                kwargs['factory'] = FaultConnection
+            return real_connect(database, *args, **kwargs)
+
+        def fsync(descriptor):
+            if parsed and stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                with real_connect(root / 'ledger.sqlite') as check:
+                    completed = check.execute('SELECT count(*) FROM attempts WHERE outcome IS NOT NULL').fetchone()[0]
+                if final_fault == 'directory_fsync' and not failures and completed:
+                    failures.append(final_fault)
+                    raise OSError('synthetic final completion fsync failure')
+                if failures and poison_fault == 'directory_fsync':
+                    poison_events.append('directory_fsync')
+                    raise OSError('synthetic poison fsync failure')
+            return real_fsync(descriptor)
+
+        def parse(_response):
+            parsed.append('parsed')
+            return ['nonempty result']
+
+        store = self.api.open_store(root, manifest=manifest, mode='synthetic')
+        assert not isinstance(store, self.api.Refusal)
+        observer = self.api.DispatchNotification()
+        with patch('sqlite3.connect', side_effect=connect), patch('os.fsync', side_effect=fsync):
+            result = store.run_engine(
+                'bing',
+                caller='native_search',
+                deadline_mono=self.now['mono'] + 3,
+                build=lambda: callbacks.append('build'),
+                send=lambda context, request: callbacks.append('send'),
+                parse=parse,
+                observer=observer,
+            )
+        self.assertEqual(parsed, ['parsed'])
+        self.assertEqual(callbacks, ['build', 'send'])
+        self.assertEqual(failures, [final_fault])
+        self.assertIn('insert', poison_events, 'poison recovery must be exercised')
+        if poison_fault in ('commit', 'directory_fsync'):
+            self.assertIn(poison_fault, poison_events)
+        self.assertIsInstance(result, self.api.Refusal)
+        self.assertEqual(result.reason, 'storage_error')
+        self.assertIsNone(observer.notify(), 'uncertain completion must never publish success')
+        self._assert_storage_hold_after_reopen(root, manifest)
+
+    def test_completion_barrier_preserves_legacy_schema_identity_and_poison(self):
+        root, manifest, _checkpoint = self.legacy_fixture(
+            'completion-legacy', unfinished=True, poison=('clock_error', 'unfinished_attempt')
+        )
+        marker = root / 'completion.pending'
+        marker.write_bytes(b'')
+        before = (root / 'ledger.sqlite').read_bytes()
+        identity = (root / 'identity').read_bytes()
+        result = self.api.migrate_legacy(root, manifest=manifest, authorization='synthetic:completion-held')
+        self.assertIsInstance(result, self.api.Refusal)
+        self.assertEqual(result.reason, 'storage_error')
+        self.assertEqual((root / 'ledger.sqlite').read_bytes(), before)
+        self.assertEqual((root / 'identity').read_bytes(), identity)
+        self.assertEqual(Path(str(root) + '.identity').read_bytes(), identity)
+        self.assertTrue(marker.is_file())
+        self._assert_storage_hold_after_reopen(root, manifest)
+
+    def test_completion_barrier_rejects_sealed_recovery_without_clearing_poison(self):
+        from wag_protection.ledger import _SyntheticMaintenanceSession
+
+        root, manifest = self.recovery_fixture('completion-recovery')
+        authorization = 'synthetic:completion-held'
+        with _SyntheticMaintenanceSession(
+            root, manifest=manifest, authorization=authorization, decision='combined'
+        ) as session:
+            binding = session.start_sender('quark')
+            session.stop_sender(binding)
+            with sqlite3.connect(root / 'ledger.sqlite') as db:
+                db.execute('INSERT INTO poison(rowid,reason) VALUES (?,?)', (5, 'unfinished_attempt'))
+            proof = session.seal(clear_poison=(self.api.PoisonSelection(5, 'unfinished_attempt'),))
+            marker = root / 'completion.pending'
+            marker.write_bytes(b'')
+            before = (root / 'ledger.sqlite').read_bytes()
+            result = self.api.recover(root, authorization=authorization, decision='combined', proof=proof)
+            self.assertIsInstance(result, self.api.Refusal)
+            self.assertEqual(result.reason, 'storage_error')
+            self.assertEqual((root / 'ledger.sqlite').read_bytes(), before)
+            self.assertTrue(marker.is_file())
+            self._assert_storage_hold_after_reopen(root, manifest)
+
+    def test_ordinary_capability_refusal_keeps_runtime_error_and_charges(self):
+        from wag_protection.contract import ProtectionError
+
+        def send(context, _request):
+            raise ProtectionError('capability_refused')
+
+        for _ in range(6):
+            result = self.attempt(send=send)
+            self.assertIsInstance(result, self.api.EngineOutcome)
+            self.assertEqual(result.outcome, 'runtime_error')
+            self.assertEqual(result.reservations, 1)
+        callbacks = []
+        result = self.attempt(build=lambda: callbacks.append('quota bypass'))
+        self.assertIsInstance(result, self.api.Refusal)
+        self.assertEqual(result.reason, 'engine_rate')
+        self.assertEqual(callbacks, [])
+
+    def test_additional_reservation_fsync_error_is_fatal_after_reopen(self):
+        import stat
+
+        reserving = False
+        faults = []
+        callbacks = []
+        real_fsync = os.fsync
+
+        def fsync(descriptor):
+            if reserving and not faults and stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                faults.append('additional reservation fsync')
+                raise OSError('synthetic send-adjacent fsync failure')
+            return real_fsync(descriptor)
+
+        def send(context, _request):
+            nonlocal reserving
+            reserving = True
+            context.reserve('proxy_connect')
+            callbacks.append('additional send')
+
+        with patch('os.fsync', side_effect=fsync):
+            result = self.attempt(send=send, parse=lambda response: callbacks.append('parse'))
+        self.assertEqual(faults, ['additional reservation fsync'])
+        self.assertEqual(callbacks, [])
+        self.assertIsInstance(result, self.api.Refusal)
+        self.assertEqual(result.reason, 'storage_error')
+        self._assert_storage_hold_after_reopen()
+
+    def test_completion_preparation_io_failure_keeps_reopen_blocked(self):
+        parsed = False
+        faults = []
+        real_fsync = os.fsync
+
+        def fsync(descriptor):
+            if parsed and not faults:
+                faults.append('first completion fsync')
+                raise OSError('synthetic completion preparation fsync failure')
+            return real_fsync(descriptor)
+
+        def parse(_response):
+            nonlocal parsed
+            parsed = True
+            return ['nonempty result']
+
+        with patch('os.fsync', side_effect=fsync):
+            result = self.attempt(parse=parse)
+        self.assertEqual(faults, ['first completion fsync'])
+        self.assertIsInstance(result, self.api.Refusal)
+        self.assertEqual(result.reason, 'storage_error')
+        self._assert_storage_hold_after_reopen()
+
+    def test_completion_commit_process_death_keeps_reopen_blocked(self):
+        import select
+
+        script = '''
+import json
+import os
+from pathlib import Path
+import sqlite3
+import sys
+import time
+import wag_protection
+root = Path(sys.argv[1])
+manifest = json.loads(sys.argv[2])
+stage = sys.argv[3]
+time.time = lambda: 10000.0
+time.monotonic = lambda: 100.0
+parsed = False
+class FaultConnection(sqlite3.Connection):  # pylint: disable=too-few-public-methods
+    def commit(self):
+        if parsed:
+            if stage == 'after':
+                super().commit()
+            print(stage, flush=True)
+            os.read(0, 1)
+        return super().commit()
+real_connect = sqlite3.connect
+def connect(database, *args, **kwargs):
+    if str(database).startswith('file:' + str(root / 'ledger.sqlite')):
+        kwargs['factory'] = FaultConnection
+    return real_connect(database, *args, **kwargs)
+sqlite3.connect = connect
+def parse(_response):
+    global parsed
+    parsed = True
+    return ['nonempty result']
+store = wag_protection.open_store(root, manifest=manifest, mode='synthetic')
+assert not isinstance(store, wag_protection.Refusal), store
+store.run_engine('bing', caller='native_search', deadline_mono=103.0,
+                 build=lambda: None, send=lambda context, request: None, parse=parse)
+'''
+        for stage in ('before', 'after'):
+            with self.subTest(stage=stage):
+                root = Path(self.parent.name) / f'completion-crash-{stage}'
+                self.api.initialize_fixture(root, registry=self.engines, clock=lambda: dict(self.now))
+                manifest = fixture_manifest(root, self.engines)
+                process = subprocess.Popen(  # pylint: disable=consider-using-with
+                    [sys.executable, '-S', '-c', script, str(root), json.dumps(manifest), stage],
+                    cwd=WORKSPACE,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                try:
+                    assert process.stdout is not None
+                    self.assertTrue(select.select([process.stdout], [], [], 5)[0], 'completion boundary not reached')
+                    self.assertEqual(process.stdout.readline().strip(), stage)
+                finally:
+                    process.kill()
+                    process.communicate(timeout=5)
+                self.assertNotEqual(process.returncode, 0)
+                self._assert_storage_hold_after_reopen(root, manifest)
+
+    def test_completion_notification_poison_failure_keeps_reopen_blocked(self):
+        import stat
+
+        observer = self.api.DispatchNotification()
+        parsed = False
+        notified = []
+        poison_faults = []
+        real_connect = sqlite3.connect
+        real_fsync = os.fsync
+
+        class FaultConnection(sqlite3.Connection):  # pylint: disable=too-few-public-methods
+            def execute(self, sql, *args, **kwargs):
+                if notified and sql.startswith('INSERT INTO poison'):
+                    poison_faults.append('insert')
+                    raise sqlite3.OperationalError('synthetic notification poison failure')
+                return super().execute(sql, *args, **kwargs)
+
+        def connect(database, *args, **kwargs):
+            if str(database).startswith('file:' + str(self.root / 'ledger.sqlite')):
+                kwargs['factory'] = FaultConnection
+            return real_connect(database, *args, **kwargs)
+
+        def fsync(descriptor):
+            if parsed and not notified and stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                with real_connect(self.root / 'ledger.sqlite') as check:
+                    completed = check.execute('SELECT count(*) FROM attempts WHERE outcome IS NOT NULL').fetchone()[0]
+                if completed:
+                    notified.append('during final completion fsync')
+                    observer.notify()
+            return real_fsync(descriptor)
+
+        def parse(_response):
+            nonlocal parsed
+            parsed = True
+            return ['nonempty result']
+
+        store = self.open()
+        assert not isinstance(store, self.api.Refusal)
+        with patch('sqlite3.connect', side_effect=connect), patch('os.fsync', side_effect=fsync):
+            result = store.run_engine(
+                'bing',
+                caller='native_search',
+                deadline_mono=self.now['mono'] + 3,
+                build=lambda: None,
+                send=lambda context, request: None,
+                parse=parse,
+                observer=observer,
+            )
+        self.assertEqual(notified, ['during final completion fsync'])
+        self.assertEqual(poison_faults, ['insert'])
+        self.assertIsInstance(result, self.api.Refusal)
+        self.assertEqual(result.reason, 'storage_error')
+        self.assertIsNone(observer.notify())
+        self._assert_storage_hold_after_reopen()
+
     def test_engine_commit_fsync_failure_poisons_ledger_before_refusing(self):
         with patch('os.fsync', side_effect=[OSError('synthetic fsync fault'), None]):
             result = self.attempt(parse=lambda response: [])
