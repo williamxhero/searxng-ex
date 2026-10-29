@@ -1,10 +1,14 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # pylint: disable=missing-module-docstring,disable=missing-class-docstring,invalid-name
 
+import copy
+
 import httpx
 from mock import patch
 
+from searx import settings
 from searx.network.network import Network, NETWORKS
+from searx.network.network import initialize
 from tests import SearxTestCase
 
 
@@ -16,6 +20,25 @@ class TestNetwork(SearxTestCase):
 
         self.assertEqual(next(network._local_addresses_cycle), None)
         self.assertEqual(next(network._proxies_cycle), ())
+
+    def test_initialize_keeps_active_networks_when_candidate_validation_fails(self):
+        old_default = NETWORKS['__DEFAULT__']
+        outgoing = copy.deepcopy(settings['outgoing'])
+        outgoing['source_ips'] = ['not-an-ip']
+
+        with self.assertRaises(ValueError):
+            initialize(settings_engines=list(settings['engines']), settings_outgoing=outgoing)
+
+        self.assertIs(NETWORKS['__DEFAULT__'], old_default)
+
+    async def test_aclose_clears_client_pool(self):
+        network = Network()
+        client = await network.get_client()
+
+        await network.aclose()
+
+        self.assertTrue(client.is_closed)
+        self.assertEqual(network._clients, {})
 
     def test_ipaddress_cycle(self):
         network = NETWORKS['ipv6']

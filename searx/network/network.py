@@ -248,6 +248,7 @@ class Network:
                 pass
 
         await asyncio.gather(*[close_client(client) for client in self._clients.values()], return_exceptions=False)
+        self._clients.clear()
 
     @staticmethod
     def extract_kwargs_clients(kwargs: dict[str, t.Any]) -> dict[str, t.Any]:
@@ -436,16 +437,14 @@ def initialize(
             network = getattr(engine, 'network', None)
             yield engine_name, engine, network
 
-    if NETWORKS:
-        done()
-    NETWORKS.clear()
-    NETWORKS[DEFAULT_NAME] = new_network({}, logger_name='default')
-    NETWORKS['ipv4'] = new_network({'local_addresses': '0.0.0.0'}, logger_name='ipv4')
-    NETWORKS['ipv6'] = new_network({'local_addresses': '::'}, logger_name='ipv6')
+    new_networks = {}
+    new_networks[DEFAULT_NAME] = new_network({}, logger_name='default')
+    new_networks['ipv4'] = new_network({'local_addresses': '0.0.0.0'}, logger_name='ipv4')
+    new_networks['ipv6'] = new_network({'local_addresses': '::'}, logger_name='ipv6')
 
     # define networks from outgoing.networks
     for network_name, network in settings_outgoing['networks'].items():
-        NETWORKS[network_name] = new_network(network, logger_name=network_name)
+        new_networks[network_name] = new_network(network, logger_name=network_name)
 
     # define networks from engines.[i].network (except references)
     for engine_name, engine, network in iter_networks():
@@ -456,22 +455,28 @@ def initialize(
                     network[attribute_name] = getattr(engine, attribute_name)
                 else:
                     network[attribute_name] = attribute_value
-            NETWORKS[engine_name] = new_network(network, logger_name=engine_name)
+            new_networks[engine_name] = new_network(network, logger_name=engine_name)
         elif isinstance(network, dict):
-            NETWORKS[engine_name] = new_network(network, logger_name=engine_name)
+            new_networks[engine_name] = new_network(network, logger_name=engine_name)
 
     # define networks from engines.[i].network (references)
     for engine_name, engine, network in iter_networks():
         if isinstance(network, str):
-            NETWORKS[engine_name] = NETWORKS[network]
+            new_networks[engine_name] = new_networks[network]
 
     # the /image_proxy endpoint has a dedicated network.
     # same parameters than the default network, but HTTP/2 is disabled.
     # It decreases the CPU load average, and the total time is more or less the same
-    if 'image_proxy' not in NETWORKS:
+    if 'image_proxy' not in new_networks:
         image_proxy_params = default_params.copy()
         image_proxy_params['enable_http2'] = False
-        NETWORKS['image_proxy'] = new_network(image_proxy_params, logger_name='image_proxy')
+        new_networks['image_proxy'] = new_network(image_proxy_params, logger_name='image_proxy')
+
+    # Build and validate the complete replacement before stopping the active
+    # generation. A malformed reload must leave the running generation alive.
+    if NETWORKS:
+        done()
+    NETWORKS.update(new_networks)
 
 
 @atexit.register
