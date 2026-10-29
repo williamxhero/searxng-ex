@@ -2,6 +2,8 @@
 # pylint: disable=missing-module-docstring,disable=missing-class-docstring,invalid-name
 
 
+import threading
+
 from searx.result_types import LegacyResult
 from searx.results import ResultContainer
 from tests import SearxTestCase
@@ -13,8 +15,6 @@ class ResultContainerTestCase(SearxTestCase):
     TEST_SETTINGS = "test_result_container.yml"
 
     def test_close_waits_for_inflight_extension_and_seals_evidence(self):
-        import threading
-
         container = ResultContainer()
         entered, release, closed = threading.Event(), threading.Event(), threading.Event()
 

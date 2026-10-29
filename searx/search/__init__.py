@@ -178,7 +178,7 @@ class Search:
                     PROCESSORS[th._engine_name].logger.error('engine timeout')
 
     def _search_protected(self, store, requests):
-        from wag_protection import DispatchNotification, Refusal  # pylint: disable=import-outside-toplevel
+        from wag_protection import Refusal  # pylint: disable=import-outside-toplevel
 
         aliases = (
             {}
@@ -228,55 +228,18 @@ class Search:
             if remaining <= 0:
                 ref.update(reason='deadline_exceeded', deadline_exceeded=True)
                 continue
-            completed = []
-            observer = DispatchNotification()
-            with self._protection_lock:
-                if self._protection_cancelled:
-                    ref.update(reason='cancelled')
-                    continue
-                self._protection_observer = observer
-
-            def work(processor, params, completed, observer):
-                try:
-                    completed.append(
-                        processor.search_protected(
-                            self.search_query.query,
-                            params,
-                            store,
-                            self.start_time,
-                            self.actual_timeout,
-                            observer=observer,
-                        )
-                    )
-                except Exception:  # no private exception text in machine evidence
-                    completed.append(Refusal('storage_error'))
-
-            thread = threading.Thread(
-                target=copy_current_request_context(work), args=(processor, params, completed, observer), daemon=True
-            )
-            try:
-                thread.start()
-                thread.join(max(0, self.start_time + self.actual_timeout - default_timer()))
-            except BaseException:
-                observer.notify()
-                raise
-            finally:
-                with self._protection_lock:
-                    self._protection_observer = None
-            if thread.is_alive():
-                # Only notify this dispatch. Its worker keeps the flock and DB,
-                # preserves NULL and commits poison at its next safe point.
-                outcome = observer.notify()
-                if outcome is None:
-                    ref.update(
-                        status='unfinished',
-                        reason='unfinished_attempt',
-                        reservations=observer.reservations,
-                        deadline_exceeded=True,
-                    )
-                    continue
-            else:
-                outcome = completed[0]
+            outcome, observer = self._run_protected_request(store, processor, params)
+            if observer is None:
+                ref.update(reason='cancelled')
+                continue
+            if outcome is None:
+                ref.update(
+                    status='unfinished',
+                    reason='unfinished_attempt',
+                    reservations=observer.reservations,
+                    deadline_exceeded=True,
+                )
+                continue
             if isinstance(outcome, Refusal):
                 ref['reason'] = outcome.reason
                 if outcome.reason == 'unfinished_attempt':
@@ -296,6 +259,57 @@ class Search:
                 processor.extend_container(self.result_container, self.start_time, outcome.results)
             else:
                 self.result_container.add_unresponsive_engine(engineref.name, outcome.outcome)
+        self._publish_protected_snapshot(store, refs)
+
+    def _run_protected_request(self, store, processor, params):
+        """Own one observer/thread lifecycle without releasing its worker's lock."""
+        from wag_protection import DispatchNotification, Refusal  # pylint: disable=import-outside-toplevel
+
+        completed = []
+        observer = DispatchNotification()
+        with self._protection_lock:
+            if self._protection_cancelled:
+                # No dispatch was scheduled; retain the existing ref-level reason.
+                return None, None
+            self._protection_observer = observer
+
+        def work(processor, params, completed, observer):
+            try:
+                completed.append(
+                    processor.search_protected(
+                        self.search_query.query,
+                        params,
+                        store,
+                        self.start_time,
+                        self.actual_timeout,
+                        observer=observer,
+                    )
+                )
+            # Keep arbitrary engine exception text out of machine evidence.
+            except Exception:  # pylint: disable=broad-exception-caught
+                completed.append(Refusal('storage_error'))
+
+        thread = threading.Thread(
+            target=copy_current_request_context(work), args=(processor, params, completed, observer), daemon=True
+        )
+        try:
+            thread.start()
+            thread.join(max(0, self.start_time + self.actual_timeout - default_timer()))
+        except BaseException:
+            observer.notify()
+            raise
+        finally:
+            with self._protection_lock:
+                self._protection_observer = None
+        if thread.is_alive():
+            # Its worker retains the flock/DB and seals unfinished state.
+            return observer.notify(), observer
+        return completed[0], observer
+
+    def _publish_protected_snapshot(self, store, refs):
+        """Publish sealed machine evidence without performing engine work."""
+        from wag_protection import Refusal  # pylint: disable=import-outside-toplevel
+
         if all(
             (ref['status'] == 'admitted' and ref['outcome'] in ('ok', 'empty'))
             or (ref['status'] == 'skipped' and ref['reason'] is None)
@@ -308,10 +322,10 @@ class Search:
             status = 'partial'
         else:
             status = 'refused'
-        from searx.network.protected import (
+        from searx.network.protected import (  # pylint: disable=import-outside-toplevel
             protection_descriptor,
             resolved_config_digest,
-        )  # pylint: disable=import-outside-toplevel
+        )
 
         manifest = protection_descriptor() if isinstance(store, Refusal) else store.manifest
         self.result_container.set_outbound_protection(

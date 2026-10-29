@@ -90,23 +90,30 @@ def get_store():
         config = validate_settings(settings['outgoing'].get('wag_protection', {'enabled': False}))
         if config['enabled'] is False:
             return Refusal('operator_hold')
-        with Path(config['artifact_manifest']).open('rb') as file:
-            raw = file.read(128 * 1024 + 1)
-        if len(raw) > 128 * 1024:
-            return Refusal('provenance_error')
-        manifest = load_json(raw.decode('utf-8'))
-        # This partial native slice has no production acceptance. Keep it held
-        # until the remaining lifecycle, migration, recovery and CI gates pass.
-        if manifest['mode'] != 'synthetic':
-            return Refusal('operator_hold')
-        store = open_store(config['root'], manifest=manifest, mode='synthetic')
-        if isinstance(store, Refusal):
-            return store
-        if store.manifest['config_digest'] != resolved_config_digest(settings['engines'], settings['outgoing']):
-            return Refusal('provenance_error')
-        return store
+        return _validated_store(config, settings)
     except (OSError, ValueError, TypeError, KeyError):
         return Refusal('provenance_error')
+
+
+def _validated_store(config, runtime_settings):
+    """Validate artifact and current config without opening a disabled store."""
+    with Path(config['artifact_manifest']).open('rb') as file:
+        raw = file.read(128 * 1024 + 1)
+    if len(raw) > 128 * 1024:
+        return Refusal('provenance_error')
+    manifest = load_json(raw.decode('utf-8'))
+    # This partial native slice has no production acceptance. Keep it held
+    # until the remaining lifecycle, migration, recovery and CI gates pass.
+    if manifest['mode'] != 'synthetic':
+        return Refusal('operator_hold')
+    store = open_store(config['root'], manifest=manifest, mode='synthetic')
+    if isinstance(store, Refusal):
+        return store
+    if store.manifest['config_digest'] != resolved_config_digest(
+        runtime_settings['engines'], runtime_settings['outgoing']
+    ):
+        return Refusal('provenance_error')
+    return store
 
 
 def protection_descriptor():
@@ -277,6 +284,20 @@ class GuardedStream(httpcore.AsyncNetworkStream):
         return self.writer.get_extra_info({'client_addr': 'sockname', 'server_addr': 'peername'}.get(info, info))
 
 
+def _configure_socket(sock, local_address, socket_options):
+    """Apply the existing bind/options to the single guarded socket."""
+    sock.setblocking(False)
+    if local_address is not None:
+        sock.bind((local_address, 0))
+    for option in socket_options or ():
+        if len(option) == 4:
+            level, name, value, length = option
+            sock.setsockopt(level, name, value, length)
+        else:
+            level, name, value = option
+            sock.setsockopt(level, name, value)
+
+
 class GuardedBackend(httpcore.AsyncNetworkBackend):
     """Pinned httpcore backend with exactly one numeric OS connect."""
 
@@ -305,16 +326,7 @@ class GuardedBackend(httpcore.AsyncNetworkBackend):
                     raise httpcore.ConnectError()
                 address_family, kind, protocol, _, address = compatible
                 sock = socket.socket(address_family, kind, protocol)
-                sock.setblocking(False)
-                if local_address is not None:
-                    sock.bind((local_address, 0))
-                for option in socket_options or ():
-                    if len(option) == 4:
-                        level, name, value, length = option
-                        sock.setsockopt(level, name, value, length)
-                    else:
-                        level, name, value = option
-                        sock.setsockopt(level, name, value)
+                _configure_socket(sock, local_address, socket_options)
                 context.check_deadline()
                 context.db.execute('UPDATE attempts SET connection_attempted=1 WHERE attempt_id=?', (context.rows[0],))
                 _commit(context.db, context.store.root)
@@ -442,8 +454,8 @@ class GuardedTransport(httpx.AsyncBaseTransport):
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         context = _dispatch()
         if not callable(self.trace) or not isinstance(
-            self.pool._network_backend, GuardedBackend
-        ):  # pylint: disable=protected-access
+            self.pool._network_backend, GuardedBackend  # pylint: disable=protected-access
+        ):
             raise ProtectionError('import_error')
         if context.main_calls:
             raise ProtectionError('redirect_refused')

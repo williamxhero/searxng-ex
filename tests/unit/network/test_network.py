@@ -134,8 +134,8 @@ class TestNetwork(SearxTestCase):
             with self.subTest(is_tor=is_tor), patch.dict(Network._TOR_CHECK_RESULT, {}, clear=True):
                 tor_requests = []
 
-                def tor_response(request, result=is_tor, requests=tor_requests):
-                    requests.append(str(request.url))
+                def tor_response(request, result=is_tor, record=tor_requests.append):
+                    record(str(request.url))
                     return httpx.Response(200, json={'IsTor': result})
 
                 # Exercise the real Tor check without opening any sockets.

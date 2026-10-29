@@ -295,29 +295,32 @@ class Network:
             return False
         return True
 
+    async def _call_protected_client(self, stream: bool, method: str, url: str, **kwargs: t.Any) -> SXNG_Response:
+        from wag_protection import EngineFailure, ProtectionError  # pylint: disable=import-outside-toplevel
+        from .protected import _dispatch  # pylint: disable=import-outside-toplevel
+
+        _dispatch()
+        if stream:
+            raise ProtectionError('helper_refused')
+        do_raise = Network.extract_do_raise_for_httperror(kwargs)
+        kwargs_clients = Network.extract_kwargs_clients(kwargs)
+        kwargs['follow_redirects'] = False
+        client = await self.get_client(**kwargs_clients)
+        client.cookies = httpx.Cookies(kwargs.pop('cookies', None))
+        try:
+            response = await client.request(method, url, **kwargs)
+        except httpx.TimeoutException:
+            raise EngineFailure('timeout') from None
+        if 300 <= response.status_code < 400:
+            raise EngineFailure('redirect_refused')
+        response.ok = not response.is_error
+        if do_raise:
+            raise_for_httperror(response)
+        return response
+
     async def call_client(self, stream: bool, method: str, url: str, **kwargs: t.Any) -> SXNG_Response:
         if self.protected:
-            from wag_protection import EngineFailure, ProtectionError  # pylint: disable=import-outside-toplevel
-            from .protected import _dispatch  # pylint: disable=import-outside-toplevel
-
-            _dispatch()
-            if stream:
-                raise ProtectionError('helper_refused')
-            do_raise = Network.extract_do_raise_for_httperror(kwargs)
-            kwargs_clients = Network.extract_kwargs_clients(kwargs)
-            kwargs['follow_redirects'] = False
-            client = await self.get_client(**kwargs_clients)
-            client.cookies = httpx.Cookies(kwargs.pop('cookies', None))
-            try:
-                response = await client.request(method, url, **kwargs)
-            except httpx.TimeoutException:
-                raise EngineFailure('timeout') from None
-            if 300 <= response.status_code < 400:
-                raise EngineFailure('redirect_refused')
-            response.ok = not response.is_error
-            if do_raise:
-                raise_for_httperror(response)
-            return response
+            return await self._call_protected_client(stream, method, url, **kwargs)
         retries = self.retries
         was_disconnected = False
         do_raise_for_httperror = Network.extract_do_raise_for_httperror(kwargs)
