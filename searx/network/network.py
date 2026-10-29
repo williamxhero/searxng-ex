@@ -59,10 +59,14 @@ class _NetworkLifecycle:
     def begin_drain(self):
         self.draining = True
 
+    def check_close_owner(self):
+        if asyncio.current_task() in self.tasks:
+            raise RuntimeError('cannot close a network from its active operation')
+
     @contextmanager
     def lease(self):
         task = asyncio.current_task()
-        if self.draining and task not in self.tasks:
+        if self.draining:
             raise RuntimeError('network generation is draining')
         self.tasks[task] = self.tasks.get(task, 0) + 1
         self.idle.clear()
@@ -236,10 +240,14 @@ class Network:
 
     async def get_client(self, verify: bool | None = None, max_redirects: int | None = None) -> httpx.AsyncClient:
         with self._lifecycle.lease():
-            async with self._lifecycle.client_lock:
-                return await self._get_client(verify, max_redirects)
+            return await self._get_client(verify, max_redirects)
 
-    async def _get_client(self, verify, max_redirects):
+    async def _get_client(self, verify=None, max_redirects=None):
+        # Internal retries belong to the already-admitted operation, not a new lease.
+        async with self._lifecycle.client_lock:
+            return await self._create_client(verify, max_redirects)
+
+    async def _create_client(self, verify, max_redirects):
         if self.protected and self.using_tor_proxy:
             from wag_protection import ProtectionError  # pylint: disable=import-outside-toplevel
 
@@ -293,6 +301,7 @@ class Network:
 
     async def aclose(self):
         # Retirement is irreversible, including cancellation/partial close failure.
+        self._lifecycle.check_close_owner()
         self._lifecycle.begin_drain()
         async with self._lifecycle.close_lock:
             await self._lifecycle.idle.wait()
@@ -360,7 +369,7 @@ class Network:
         do_raise = Network.extract_do_raise_for_httperror(kwargs)
         kwargs_clients = Network.extract_kwargs_clients(kwargs)
         kwargs['follow_redirects'] = False
-        client = await self.get_client(**kwargs_clients)
+        client = await self._get_client(**kwargs_clients)
         client.cookies = httpx.Cookies(kwargs.pop('cookies', None))
         try:
             response = await client.request(method, url, **kwargs)
@@ -387,7 +396,7 @@ class Network:
         do_raise_for_httperror = Network.extract_do_raise_for_httperror(kwargs)
         kwargs_clients = Network.extract_kwargs_clients(kwargs)
         while retries >= 0:  # pragma: no cover
-            client = await self.get_client(**kwargs_clients)
+            client = await self._get_client(**kwargs_clients)
             cookies = kwargs.pop("cookies", None)
             client.cookies = httpx.Cookies(cookies)
             try:
@@ -428,7 +437,9 @@ class Network:
     async def aclose_all(cls, networks=None):
         # pylint: disable=protected-access
         networks = list(dict.fromkeys(NETWORKS.values() if networks is None else networks))
-        # Close admission across the whole generation before the first await.
+        # Check every owner before retiring any peer, then close admission before awaiting.
+        for network in networks:
+            network._lifecycle.check_close_owner()
         for network in networks:
             network._lifecycle.begin_drain()
         await asyncio.gather(*[network._lifecycle.idle.wait() for network in networks])

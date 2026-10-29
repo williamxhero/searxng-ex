@@ -226,6 +226,45 @@ class TestNetworkLifecycle(SearxTestCase):
             for client in clients:
                 await client.aclose()
 
+    async def test_draining_rejects_new_requests_from_a_live_stream_owner(self):
+        @asynccontextmanager
+        async def stream(*args, **kwargs):  # pylint: disable=unused-argument
+            yield httpx.Response(200, text='stream')
+
+        network = Network()
+        close_task = None
+        try:
+            with (
+                patch.object(httpx.AsyncClient, 'stream', new=stream),
+                patch.object(httpx.AsyncClient, 'request', return_value=httpx.Response(200)) as send,
+            ):
+                async with await network.stream('GET', 'https://example.com/'):
+                    close_task = asyncio.create_task(network.aclose())
+                    await asyncio.sleep(0)
+                    with self.assertRaises(RuntimeError):
+                        await network.request('GET', 'https://example.com/new')
+                    send.assert_not_called()
+        finally:
+            if close_task is not None:
+                await close_task
+
+    async def test_stream_owner_close_refuses_instead_of_waiting_on_itself(self):
+        @asynccontextmanager
+        async def stream(*args, **kwargs):  # pylint: disable=unused-argument
+            yield httpx.Response(200, text='stream')
+
+        for group in (False, True):
+            network = Network()
+            with self.subTest(group=group), patch.object(httpx.AsyncClient, 'stream', new=stream):
+                async with await network.stream('GET', 'https://example.com/'):
+                    async with asyncio.timeout(0.05):
+                        with self.assertRaisesRegex(RuntimeError, 'active operation'):
+                            if group:
+                                await Network.aclose_all([network])
+                            else:
+                                await network.aclose()
+            await network.aclose()
+
     async def test_aclose_clears_client_pool(self):
         network = Network()
         client = await network.get_client()
