@@ -536,6 +536,103 @@ class ProtectedTransportTest(unittest.TestCase):  # pylint: disable=too-many-pub
         self.assertEqual(error.exception.reason, 'provenance_error')
         self.assertEqual(self.tls_server.headers, 0)
 
+    def test_load_engine_refuses_shadow_source_before_loader(self):
+        from searx import engines, settings
+
+        _, root, _ = self.native_search_fixture()
+        before = (root / 'ledger.sqlite').read_bytes()
+        shadow = Path(self.parent.name) / 'shadow-engines'
+        shadow.mkdir()
+        # If preflight is bypassed, executing this source must fail the test.
+        (shadow / 'bing.py').write_text("raise AssertionError('shadow source executed')\n", encoding='utf-8')
+        with patch.object(engines, 'ENGINE_DIR', str(shadow)):
+            with self.assertRaises(self.api.ProtectionError) as error:
+                engines.load_engine(dict(settings['engines'][0]))
+        self.assertEqual(error.exception.reason, 'provenance_error')
+        self.assertEqual((root / 'ledger.sqlite').read_bytes(), before)
+        self.assertEqual((self.server.headers, self.tls_server.headers), (0, 0))
+
+    def test_load_engine_rechecks_loaded_source_after_loader(self):
+        from searx import engines, settings
+
+        _, root, _ = self.native_search_fixture()
+        before = (root / 'ledger.sqlite').read_bytes()
+        load_module = engines.load_module
+
+        def shadow_origin(filename, module_dir):
+            module = load_module(filename, module_dir)
+            module.__file__ = str(Path(self.parent.name) / 'shadow-bing.py')
+            return module
+
+        with patch.object(engines, 'load_module', shadow_origin):
+            with self.assertRaises(self.api.ProtectionError) as error:
+                engines.load_engine(dict(settings['engines'][0]))
+        self.assertEqual(error.exception.reason, 'provenance_error')
+        self.assertEqual((root / 'ledger.sqlite').read_bytes(), before)
+        self.assertEqual((self.server.headers, self.tls_server.headers), (0, 0))
+
+    def test_load_engine_enabled_flip_after_loader_refuses_operator_hold(self):
+        from searx import engines, settings
+
+        _, root, _ = self.native_search_fixture()
+        before = (root / 'ledger.sqlite').read_bytes()
+        load_module = engines.load_module
+
+        def disable_after_load(filename, module_dir):
+            module = load_module(filename, module_dir)
+            settings['outgoing']['wag_protection']['enabled'] = False
+            return module
+
+        with patch.object(engines, 'load_module', disable_after_load):
+            with self.assertRaises(self.api.ProtectionError) as error:
+                engines.load_engine(dict(settings['engines'][0]))
+        self.assertEqual(error.exception.reason, 'operator_hold')
+        self.assertEqual((root / 'ledger.sqlite').read_bytes(), before)
+        self.assertEqual((self.server.headers, self.tls_server.headers), (0, 0))
+
+    def test_engine_source_preflight_filesystem_errors_refuse_provenance(self):
+        from searx import engines, settings
+        from searx.network.protected import validate_engine_source
+
+        _, root, manifest = self.native_search_fixture()
+        before = (root / 'ledger.sqlite').read_bytes()
+        engine_data = dict(settings['engines'][0])
+        approved = next(entry for entry in manifest['registry'] if entry['engine'] == engine_data['name'])
+        expected = Path(engines.ENGINE_DIR) / 'bing.py'
+        read_bytes, is_file = Path.read_bytes, Path.is_file
+
+        def filesystem_fault(operation, failure):
+            # The real store first validates its manifest. Inject a
+            # filesystem race only after that approved source read.
+            state = {'validated': False}
+
+            def checked_file(path):
+                if path == expected and state['validated'] and operation == 'is_file':
+                    raise failure('source became inaccessible after manifest validation')
+                return is_file(path)
+
+            def checked_read(path):
+                if path == expected and state['validated'] and operation == 'read_bytes':
+                    raise failure('source became unreadable after manifest validation')
+                raw = read_bytes(path)
+                if path == expected:
+                    state['validated'] = True
+                return raw
+
+            return checked_file, checked_read, state
+
+        for operation in ('is_file', 'read_bytes'):
+            for failure in (OSError, ValueError):
+                with self.subTest(operation=operation, failure=failure.__name__):
+                    checked_file, checked_read, state = filesystem_fault(operation, failure)
+                    with patch.object(Path, 'is_file', checked_file), patch.object(Path, 'read_bytes', checked_read):
+                        with self.assertRaises(self.api.ProtectionError) as error:
+                            validate_engine_source(engine_data, engines.ENGINE_DIR, approved)
+                    self.assertTrue(state['validated'])
+                    self.assertEqual(error.exception.reason, 'provenance_error')
+                    self.assertEqual((root / 'ledger.sqlite').read_bytes(), before)
+                    self.assertEqual((self.server.headers, self.tls_server.headers), (0, 0))
+
     def test_transport_rejects_incompatible_dependency_versions_before_connect(self):
         import httpcore
         import httpx

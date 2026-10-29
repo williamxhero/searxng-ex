@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # pylint: disable=missing-module-docstring,disable=missing-class-docstring,invalid-name
 
-from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import patch
+import subprocess
+import sys
 
 from searx import settings, engines
-from wag_protection import ProtectionError
 from tests import SearxTestCase
 
 
@@ -23,42 +21,23 @@ class TestEnginesInit(SearxTestCase):
         self.assertIn('engine1', engines.engines)
         self.assertIn('engine2', engines.engines)
 
-    def test_load_engine_refuses_shadow_source_before_loader(self):
-        approved = {'module': 'bing'}
-        with (
-            patch.dict(settings['outgoing'], {'wag_protection': {'enabled': True}}),
-            patch('searx.network.protected.validate_engine_settings', return_value=approved),
-            patch(
-                'searx.network.protected.validate_engine_source',
-                side_effect=ProtectionError('provenance_error'),
-            ),
-            patch('searx.engines.load_module') as load_module,
-        ):
-            with self.assertRaises(ProtectionError):
-                engines.load_engine({'name': 'bing', 'engine': 'bing'})
+    def test_load_engine_off_does_not_import_protection(self):
+        script = """
+import sys
 
-        load_module.assert_not_called()
+class DenyProtectionImports:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split('.')[0] == 'wag_protection' or fullname == 'searx.network.protected':
+            raise AssertionError('off-mode imported ' + fullname)
 
-    def test_load_engine_rechecks_loaded_source_after_loader(self):
-        approved = {'module': 'bing'}
-        store = SimpleNamespace(manifest={})
-        loaded = SimpleNamespace()
-        with (
-            patch.dict(settings['outgoing'], {'wag_protection': {'enabled': True}}),
-            patch('searx.network.protected.validate_engine_settings', return_value=approved),
-            patch('searx.network.protected.validate_engine_source', return_value=Path('/approved/bing.py')),
-            patch('searx.network.protected.get_store', return_value=store),
-            patch(
-                'searx.network.protected.validate_loaded_engine_source',
-                side_effect=ProtectionError('provenance_error'),
-            ) as validate_loaded,
-            patch('searx.engines.load_module', return_value=loaded) as load_module,
-        ):
-            result = engines.load_engine({'name': 'bing', 'engine': 'bing'})
-
-        self.assertIsNone(result)
-        load_module.assert_called_once_with('bing.py', engines.ENGINE_DIR)
-        validate_loaded.assert_called_once_with(loaded, Path('/approved/bing.py'), approved, {})
+sys.meta_path.insert(0, DenyProtectionImports())
+from searx import settings, engines
+settings['outgoing']['wag_protection'] = {'enabled': False}
+engine = engines.load_engine({'name': 'dummy', 'engine': 'dummy'})
+assert engine is not None
+"""
+        result = subprocess.run([sys.executable, '-c', script], capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_initialize_engines_exclude_onions(self):
         settings['outgoing']['using_tor_proxy'] = False

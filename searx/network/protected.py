@@ -184,12 +184,12 @@ def validate_engine_source(engine_data, engine_dir, approved=None):
     try:
         expected = canonical_path(Path(store.manifest['module_root']) / relative)
         actual = canonical_path(Path(engine_dir) / f'{module}.py')
+        if actual != expected or not actual.is_file():
+            raise ProtectionError('provenance_error')
+        if hashlib.sha256(actual.read_bytes()).hexdigest() != store.manifest['files'].get(relative):
+            raise ProtectionError('provenance_error')
     except (OSError, ValueError) as error:
         raise ProtectionError('provenance_error') from error
-    if actual != expected or not actual.is_file():
-        raise ProtectionError('provenance_error')
-    if hashlib.sha256(actual.read_bytes()).hexdigest() != store.manifest['files'].get(relative):
-        raise ProtectionError('provenance_error')
     return expected
 
 

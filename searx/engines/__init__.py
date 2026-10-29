@@ -10,8 +10,6 @@ usage::
 
 import typing as t
 
-# pylint: disable=ungrouped-imports
-
 import sys
 import copy
 import os
@@ -23,7 +21,6 @@ import inspect
 import msgspec
 
 from searx import logger, settings
-from wag_protection import ProtectionError, Refusal
 from searx.utils import load_module
 from searx.data import ENGINE_TRAITS
 from searx.enginelib import Engine, EngineAbout
@@ -113,6 +110,7 @@ def load_engine(engine_data: dict[str, t.Any]) -> "Engine | types.ModuleType | N
     """
     # pylint: disable=too-many-return-statements,too-many-branches
 
+    protected_load = settings['outgoing'].get('wag_protection', {}).get('enabled', False) is not False
     engine_name = engine_data.get('name')
     if engine_name is None:
         logger.error('An engine does not have a "name" field')
@@ -131,7 +129,8 @@ def load_engine(engine_data: dict[str, t.Any]) -> "Engine | types.ModuleType | N
     if module_name is None:
         logger.error('The "engine" field is missing for the engine named "{}"'.format(engine_name))
         return None
-    if settings['outgoing'].get('wag_protection', {}).get('enabled', False) is not False:
+    if protected_load:
+        from wag_protection import ProtectionError, Refusal  # pylint: disable=import-outside-toplevel
         from searx.network.protected import (  # pylint: disable=import-outside-toplevel
             get_store,
             validate_engine_settings,
@@ -143,17 +142,18 @@ def load_engine(engine_data: dict[str, t.Any]) -> "Engine | types.ModuleType | N
         expected_source = validate_engine_source(engine_data, ENGINE_DIR, approved)
     try:
         engine = load_module(module_name + '.py', ENGINE_DIR)
-        if settings['outgoing'].get('wag_protection', {}).get('enabled', False) is not False:
-            store = get_store()
-            if isinstance(store, Refusal):
-                raise ProtectionError(store.reason)
-            validate_loaded_engine_source(engine, expected_source, approved, store.manifest)
     except (SyntaxError, KeyboardInterrupt, SystemExit, SystemError, ImportError, RuntimeError):
         logger.exception('Fatal exception in engine "{}"'.format(module_name))
         sys.exit(1)
     except BaseException:
         logger.exception('Cannot load engine "{}"'.format(module_name))
         return None
+
+    if protected_load:
+        store = get_store()
+        if isinstance(store, Refusal):
+            raise ProtectionError(store.reason)
+        validate_loaded_engine_source(engine, expected_source, approved, store.manifest)
 
     check_engine_module(engine)
     update_engine_attributes(engine, engine_data)
