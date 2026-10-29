@@ -382,9 +382,17 @@ def validate_manifest(manifest, root, mode):
         file = canonical_path(module_root / relative)
         if not file.is_file() or hashlib.sha256(file.read_bytes()).hexdigest() != expected:
             raise ValueError('artifact file mismatch')
-    for name in ('wag_protection/__init__.py', 'wag_protection/ledger.py', 'wag_protection/contract.py'):
-        if name not in files:
-            raise ValueError('missing core artifact file')
+    required_files = (
+        'wag_protection/__init__.py', 'wag_protection/ledger.py', 'wag_protection/contract.py',
+        'searx/data/engine_traits.json', 'searx/engines/__init__.py',
+        'searx/settings.yml', 'searx/settings_defaults.py', 'searx/settings_loader.py',
+        'searx/network/__init__.py', 'searx/network/client.py', 'searx/network/network.py',
+        'searx/network/protected.py', 'searx/search/__init__.py',
+        'searx/search/processors/abstract.py', 'searx/search/processors/online.py',
+        'searx/results.py', 'searx/webutils.py', 'searx/webapp.py', 'searx/exceptions.py', 'searx/utils.py',
+    )
+    if any(name not in files for name in required_files):
+        raise ValueError('missing native artifact file')
     distributions = manifest['distributions']
     wheels = manifest['wheels']
     if not isinstance(distributions, dict) or not isinstance(wheels, dict):
@@ -395,6 +403,12 @@ def validate_manifest(manifest, root, mode):
     for name, expected in wheels.items():
         if Path(name).name != name or not name.endswith('.whl') or not hex_value(expected, 64):
             raise ValueError('invalid wheel declaration')
+        # A declared hash is not provenance without the approved wheel bytes.
+        # Bind it to exactly one artifact-relative file already checked above;
+        # no extra manifest field or implicit external wheel cache is trusted.
+        matches = [path for path, digest in files.items() if Path(path).name == name and digest == expected]
+        if len(matches) != 1:
+            raise ValueError('unverified wheel artifact')
     registry = validate_registry(manifest['registry'])
     if json_digest(registry) != manifest['registry_digest']:
         raise ValueError('registry mismatch')

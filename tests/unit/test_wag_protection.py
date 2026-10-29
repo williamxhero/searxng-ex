@@ -155,6 +155,12 @@ def fixture_manifest(root, engines):
             WORKSPACE / 'searx/search/__init__.py',
             WORKSPACE / 'searx/search/processors/abstract.py',
             WORKSPACE / 'searx/search/processors/online.py',
+            WORKSPACE / 'searx/settings_loader.py',
+            WORKSPACE / 'searx/results.py',
+            WORKSPACE / 'searx/webutils.py',
+            WORKSPACE / 'searx/webapp.py',
+            WORKSPACE / 'searx/exceptions.py',
+            WORKSPACE / 'searx/utils.py',
         ]
     }
     python = Path(sys.executable).resolve()
@@ -2214,6 +2220,31 @@ store.run_engine('bing', caller='probe', deadline_mono=103.0,
                 self.api.validate_settings({'enabled': value})
         with self.assertRaises(ValueError):
             self.api.validate_settings({'enabled': False, 'enable': True})
+
+    def test_manifest_missing_native_artifact_refuses_before_storage(self):
+        from wag_protection.contract import ARTIFACT_FIELDS
+
+        for missing in ('searx/network/network.py', 'searx/data/engine_traits.json'):
+            with self.subTest(missing=missing):
+                manifest = {**self.manifest, 'files': dict(self.manifest['files'])}
+                del manifest['files'][missing]
+                manifest['artifact_digest'] = digest({key: manifest[key] for key in ARTIFACT_FIELDS})
+                before = {path.name: path.read_bytes() for path in self.root.iterdir() if path.is_file()}
+                refused = self.api.open_store(self.root, manifest=manifest, mode='synthetic')
+                self.assertIsInstance(refused, self.api.Refusal)
+                self.assertEqual(refused.reason, 'provenance_error')
+                self.assertEqual(before, {path.name: path.read_bytes() for path in self.root.iterdir() if path.is_file()})
+
+    def test_manifest_unbacked_wheel_hash_refuses_before_storage(self):
+        manifest = {**self.manifest, 'wheels': {'httpx-0.28.1-py3-none-any.whl': 'a' * 64}}
+        from wag_protection.contract import ARTIFACT_FIELDS
+
+        manifest['artifact_digest'] = digest({key: manifest[key] for key in ARTIFACT_FIELDS})
+        before = {path.name: path.read_bytes() for path in self.root.iterdir() if path.is_file()}
+        refused = self.api.open_store(self.root, manifest=manifest, mode='synthetic')
+        self.assertIsInstance(refused, self.api.Refusal)
+        self.assertEqual(refused.reason, 'provenance_error')
+        self.assertEqual(before, {path.name: path.read_bytes() for path in self.root.iterdir() if path.is_file()})
 
     def test_manifest_unknown_field_and_shadow_file_refuse_before_build(self):
         assert isinstance(self.manifest['files'], Mapping)
