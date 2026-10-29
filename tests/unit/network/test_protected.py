@@ -1020,6 +1020,7 @@ print(json.dumps({'reason': getattr(result, 'reason', None), 'calls': calls}))
             self.assertEqual(db.execute('SELECT reason FROM poison').fetchall(), [])
 
     def test_missing_header_trace_refuses_before_socket_creation(self):
+        import sqlite3
         import httpx
         from searx.engines import quark
         from searx.network.client import get_loop
@@ -1039,8 +1040,11 @@ print(json.dumps({'reason': getattr(result, 'reason', None), 'calls': calls}))
             send=lambda context, request_params: context.run_async(request, get_loop()),
             parse=quark.response,
         )
-        self.assertNotEqual(result.outcome, 'ok')
+        assert isinstance(result, self.api.Refusal)
+        self.assertEqual(result.reason, 'import_error')
         self.assertEqual((self.server.accepts, self.server.headers), (0, 0))
+        with sqlite3.connect(self.root / 'ledger.sqlite') as db:
+            self.assertEqual(db.execute('SELECT reason FROM poison').fetchall(), [('unfinished_attempt',)])
 
     def test_raw_native_settings_reject_non_boolean_before_schema_coercion(self):
         from searx.settings_defaults import SCHEMA, apply_schema

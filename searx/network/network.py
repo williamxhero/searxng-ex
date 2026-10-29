@@ -63,6 +63,7 @@ class Network:
         '_active_requests',
         '_drain_event',
         '_draining',
+        '_managed',
         '_logger',
         'protected',
     )
@@ -108,6 +109,7 @@ class Network:
         self._drain_event = asyncio.Event()
         self._drain_event.set()
         self._draining = False
+        self._managed = False
         self._logger = logger.getChild(logger_name) if logger_name else logger
         self.check_parameters()
 
@@ -205,7 +207,7 @@ class Network:
         return result
 
     async def get_client(self, verify: bool | None = None, max_redirects: int | None = None) -> httpx.AsyncClient:
-        if self._draining:
+        if self._draining or (self._managed and not any(network is self for network in NETWORKS.values())):
             raise RuntimeError('network generation is draining')
         if self.protected and self.using_tor_proxy:
             from wag_protection import ProtectionError  # pylint: disable=import-outside-toplevel
@@ -336,7 +338,7 @@ class Network:
         return response
 
     async def call_client(self, stream: bool, method: str, url: str, **kwargs: t.Any) -> SXNG_Response:
-        if self._draining:
+        if self._draining or (self._managed and not any(network is self for network in NETWORKS.values())):
             raise RuntimeError('network generation is draining')
         self._active_requests += 1
         self._drain_event.clear()
@@ -508,6 +510,8 @@ def initialize(
         _close_network_generation(old_networks)
         NETWORKS.clear()
     NETWORKS.update(new_networks)
+    for network in dict.fromkeys(new_networks.values()):
+        network._managed = True  # pylint: disable=protected-access
 
 
 def _close_network_generation(networks):
@@ -522,6 +526,8 @@ def _close_network_generation(networks):
             raise
     else:
         asyncio.run(Network.aclose_all(networks))
+    for network in networks:
+        network._draining = False  # pylint: disable=protected-access
 
 
 @atexit.register
@@ -542,3 +548,4 @@ def done():
 
 
 NETWORKS[DEFAULT_NAME] = Network()
+NETWORKS[DEFAULT_NAME]._managed = True  # pylint: disable=protected-access
