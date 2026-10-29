@@ -792,7 +792,8 @@ class Store:
                 db.execute('UPDATE release_checks SET state=?,finished_mono=?,evidence_json=? WHERE release_id=?',
                            ('complete', now['mono'], canonical_json(evidence), receipt.release_id))
                 db.execute('UPDATE state SET checkpoint=?', (canonical_json(now),))
-                _commit(db, self.root)
+                _commit(db, self.root, completion=True)
+                (self.root / _COMPLETION_PENDING).unlink()
                 return evidence
         except ProtectionError as error:
             return Refusal(error.reason)
@@ -1338,7 +1339,8 @@ def recover(root, *, authorization, decision, proof) -> RecoveryResult | Refusal
             db.execute('UPDATE state SET checkpoint=?', (canonical_json(now),))
             for selection in proof.capability.clear_poison:
                 db.execute('DELETE FROM poison WHERE rowid=? AND reason=?', (selection.rowid, selection.reason))
-            _commit(db, root)
+            _commit(db, root, completion=True)
+            (root / _COMPLETION_PENDING).unlink()
             return RecoveryResult(recovery_id, decision, len(unfinished), len(attempts) if reanchor else 0)
     except ProtectionError as error:
         return Refusal(error.reason)

@@ -1181,10 +1181,12 @@ with _SyntheticMaintenanceSession(root, manifest=manifest, authorization='synthe
                     process.kill()
                     process.communicate(timeout=5)
                     self.assertEqual(process.returncode, -9)
-                    # Reopen the actual database, including SQLite hot-journal rollback after precommit death.
-                    self.assertFalse(
-                        isinstance(self.api.open_store(root, manifest=manifest, mode='synthetic'), self.api.Refusal)
-                    )
+                    # Public admission remains held after either uncertain boundary.
+                    reopened = self.api.open_store(root, manifest=manifest, mode='synthetic')
+                    self.assertIsInstance(reopened, self.api.Refusal)
+                    self.assertEqual(reopened.reason, 'storage_error')
+                    # Inspect the real DB, including hot-journal rollback after precommit death.
+                    # Preserve every old-or-complete-new history/accounting assertion below.
                     with sqlite3.connect(root / 'ledger.sqlite') as db:
                         db.row_factory = sqlite3.Row
                         attempts = [dict(row) for row in db.execute('SELECT * FROM attempts ORDER BY attempt_id')]
@@ -1746,6 +1748,50 @@ store.run_engine('bing', caller='native_search', deadline_mono=103.0,
         assert isinstance(refused, self.api.Refusal)
         self.assertEqual(refused.reason, 'unfinished_attempt')
 
+    def test_recovery_final_commit_uncertainty_holds_fresh_open(self):
+        from wag_protection.ledger import _SyntheticMaintenanceSession
+
+        root, manifest = self.recovery_fixture('recovery-final-commit-uncertainty')
+        authorization = 'synthetic:final-commit-uncertainty'
+        real_connect, real_fsync = sqlite3.connect, os.fsync
+        final_failed = False
+
+        class FaultConnection(sqlite3.Connection):  # pylint: disable=too-few-public-methods
+            def execute(self, sql, *args, **kwargs):
+                if final_failed and sql.startswith('INSERT INTO poison'):
+                    raise sqlite3.OperationalError('synthetic poison insert failure')
+                return super().execute(sql, *args, **kwargs)
+
+        def connect(database, *args, **kwargs):
+            if str(database).startswith('file:' + str(root / 'ledger.sqlite')):
+                kwargs['factory'] = FaultConnection
+            return real_connect(database, *args, **kwargs)
+
+        def fsync(descriptor):
+            nonlocal final_failed
+            if not final_failed and os.fstat(descriptor).st_ino == root.stat().st_ino:
+                with real_connect(root / 'ledger.sqlite') as check:
+                    if check.execute('SELECT count(*) FROM recoveries').fetchone()[0]:
+                        final_failed = True
+                        raise OSError('synthetic recovery completion fsync failure')
+            return real_fsync(descriptor)
+
+        with _SyntheticMaintenanceSession(
+            root, manifest=manifest, authorization=authorization, decision='combined'
+        ) as session:
+            binding = session.start_sender('quark')
+            session.stop_sender(binding)
+            with sqlite3.connect(root / 'ledger.sqlite') as db:
+                db.execute('INSERT INTO poison(rowid,reason) VALUES (?,?)', (5, 'clock_error'))
+            proof = session.seal(clear_poison=(self.api.PoisonSelection(5, 'clock_error'),))
+            with patch('sqlite3.connect', side_effect=connect), patch('os.fsync', side_effect=fsync):
+                result = self.api.recover(root, authorization=authorization, decision='combined', proof=proof)
+        self.assertIsInstance(result, self.api.Refusal)
+        self.assertEqual(result.reason, 'storage_error')
+        reopened = self.api.open_store(root, manifest=manifest, mode='synthetic')
+        self.assertIsInstance(reopened, self.api.Refusal)
+        self.assertEqual(reopened.reason, 'storage_error')
+
     def test_recovery_postcommit_fsync_uncertainty_refuses_without_rollback_or_retry(self):
         from wag_protection.ledger import _SyntheticMaintenanceSession
 
@@ -1764,11 +1810,16 @@ store.run_engine('bing', caller='native_search', deadline_mono=103.0,
             proof = session.seal()
             before = (root / 'ledger.sqlite').read_bytes()
             observed = []
+            real_fsync = os.fsync
 
             def fail_directory_fsync(descriptor):
-                self.assertEqual(os.fstat(descriptor).st_ino, root.stat().st_ino)
+                if os.fstat(descriptor).st_ino != root.stat().st_ino:
+                    return real_fsync(descriptor)
                 with sqlite3.connect(root / 'ledger.sqlite') as db:
-                    observed.append(db.execute('SELECT count(*) FROM recoveries').fetchone()[0])
+                    completed = db.execute('SELECT count(*) FROM recoveries').fetchone()[0]
+                    if not completed:
+                        return real_fsync(descriptor)
+                    observed.append(completed)
                     self.assertEqual(
                         db.execute('SELECT outcome FROM attempts WHERE engine=?', ('quark',)).fetchone()[0],
                         'unknown_terminated',
@@ -1808,9 +1859,9 @@ store.run_engine('bing', caller='native_search', deadline_mono=103.0,
                 'capability_refused',
             )
             self.assertTrue((root / 'ledger.sqlite').read_bytes() == after, 'uncertain recovery was retried')
-            self.assertFalse(
-                isinstance(self.api.open_store(root, manifest=manifest, mode='synthetic'), self.api.Refusal)
-            )
+            reopened = self.api.open_store(root, manifest=manifest, mode='synthetic')
+            self.assertIsInstance(reopened, self.api.Refusal)
+            self.assertEqual(reopened.reason, 'storage_error')
 
     # Keep ownership and counterfeit-proof checks attached to their original live maintenance session.
     # pylint: disable-next=too-many-locals,too-many-statements
@@ -2702,6 +2753,69 @@ store.run_engine('bing', caller='probe', deadline_mono=103.0,
         snapshot = snapshot_store.public_snapshot(artifact, config)
         assert isinstance(snapshot, self.api.Refusal)
         self.assertEqual(snapshot.reason, 'evidence_unknown')
+
+    def test_release_final_commit_uncertainty_holds_fresh_open(self):
+        store = self.open()
+        assert not isinstance(store, self.api.Refusal)
+        release_id = '5' * 32
+        artifact, config = self.manifest['artifact_digest'], self.manifest['config_digest']
+        receipt = store.claim_release(release_id, artifact, config, self.now['mono'] + 10)
+        real_connect, real_fsync = sqlite3.connect, os.fsync
+        final_failed = False
+
+        class FaultConnection(sqlite3.Connection):  # pylint: disable=too-few-public-methods
+            def execute(self, sql, *args, **kwargs):
+                if final_failed and sql.startswith('INSERT INTO poison'):
+                    raise sqlite3.OperationalError('synthetic poison insert failure')
+                return super().execute(sql, *args, **kwargs)
+
+        def connect(database, *args, **kwargs):
+            if str(database).startswith('file:' + str(self.root / 'ledger.sqlite')):
+                kwargs['factory'] = FaultConnection
+            return real_connect(database, *args, **kwargs)
+
+        def fsync(descriptor):
+            nonlocal final_failed
+            if not final_failed and os.fstat(descriptor).st_ino == self.root.stat().st_ino:
+                with real_connect(self.root / 'ledger.sqlite') as check:
+                    if (
+                        check.execute('SELECT state FROM release_checks WHERE release_id=?', (release_id,)).fetchone()[
+                            0
+                        ]
+                        == 'complete'
+                    ):
+                        final_failed = True
+                        raise OSError('synthetic release completion fsync failure')
+            return real_fsync(descriptor)
+
+        def operation():
+            ingress = self.open()
+            self.assertEqual(ingress.consume_release_ingress(release_id, artifact, config), True)
+            return {
+                'version': 2,
+                'release_id': release_id,
+                'artifact_digest': artifact,
+                'config_digest': config,
+                'checked_at': '1970-01-01T02:46:40+00:00',
+                'age_s': 0,
+                'search': {
+                    'status': 'passed',
+                    'result_count': 2,
+                    'responsive_engine_count': 2,
+                    'protection_status': 'complete',
+                    'quality_evidence_digest': 'b' * 64,
+                    'reason': None,
+                },
+                'egress': {'status': 'passed', 'reason': None},
+            }
+
+        with patch('sqlite3.connect', side_effect=connect), patch('os.fsync', side_effect=fsync):
+            result = store.run_release_check(receipt, operation)
+        self.assertIsInstance(result, self.api.Refusal)
+        self.assertEqual(result.reason, 'storage_error')
+        reopened = self.api.open_store(self.root, manifest=self.manifest, mode='synthetic')
+        self.assertIsInstance(reopened, self.api.Refusal)
+        self.assertEqual(reopened.reason, 'storage_error')
 
     def test_release_operation_crash_consumes_claim_permanently(self):
         store = self.open()
