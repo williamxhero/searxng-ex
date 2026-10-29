@@ -12,6 +12,7 @@ import os
 import py_compile
 from pathlib import Path
 import sys
+import sysconfig
 import tempfile
 from unittest import TestCase
 from unittest.mock import patch
@@ -61,6 +62,8 @@ class DependencyProvenanceTest(TestCase):  # pylint: disable=too-many-public-met
         self.directory = Path(self.temporary.name)
         self.site = self.directory / "site"
         self.site.mkdir()
+        self.scripts = self.directory / "bin"
+        self.launcher = self.scripts / "fixture-cli"
         self.wheel = self.directory / WHEEL_NAME
         self.payload = {
             PAYLOAD: b'"""Never imported test fixture."""\n',
@@ -209,6 +212,99 @@ class DependencyProvenanceTest(TestCase):  # pylint: disable=too-many-public-met
         # An installed-artifact hash cannot override the wheel's shipped code.
         with self.assertRaises(ValueError):
             self._validate(self._seal(manifest))
+
+    def _console_manifest(self):
+        self.payload[DIST_INFO + "/entry_points.txt"] = (
+            b"[console_scripts]\nfixture-cli = wag_provenance_fixture:main\n"
+        )
+        self._write_wheel()
+        self._write_installed()
+        self.scripts.mkdir()
+        launcher = self.launcher
+        # Actual Linux pip/distlib launcher shape, not imported or executed.
+        launcher.write_text(
+            f"#!{sys.executable}\n"
+            "# -*- coding: utf-8 -*-\n"
+            "import re\n"
+            "import sys\n"
+            "from wag_provenance_fixture import main\n"
+            "if __name__ == '__main__':\n"
+            "    sys.argv[0] = re.sub(r'(-script\\.pyw|\\.exe)?$', '', sys.argv[0])\n"
+            "    sys.exit(main())\n",
+            encoding="utf-8",
+        )
+        record = self.site / DIST_INFO / "RECORD"
+        with record.open("a", encoding="utf-8") as output:
+            output.write(os.path.relpath(launcher, self.site) + ",,\n")
+        manifest = self._manifest()
+        manifest["files"][str(record.relative_to(WORKSPACE))] = sha256(record.read_bytes()).hexdigest()
+        manifest = self._seal(manifest)
+        return manifest
+
+    def test_production_accepts_wheel_declared_console_launcher(self):
+        manifest = self._console_manifest()
+        with patch.object(sysconfig, "get_path", return_value=str(self.scripts)):
+            self.assertEqual(self._validate(manifest), manifest)
+
+    def test_production_rejects_modified_console_launcher_body_or_interpreter(self):
+        manifest = self._console_manifest()
+        original = self.launcher.read_bytes()
+        variants = (
+            original.replace(b"import main", b"import other"),
+            original.replace(sys.executable.encode(), b"/unapproved/python"),
+            original + b"# appended executable content\n",
+        )
+        with patch.object(sysconfig, "get_path", return_value=str(self.scripts)):
+            for contents in variants:
+                with self.subTest(contents=contents):
+                    self.launcher.write_bytes(contents)
+                    with self.assertRaisesRegex(ValueError, "installed launcher mismatch"):
+                        self._validate(manifest)
+        self.launcher.write_bytes(original)
+
+    def test_production_rejects_noncanonical_console_record_paths(self):
+        manifest = self._console_manifest()
+        record = self.site / DIST_INFO / "RECORD"
+        original = record.read_text(encoding="utf-8")
+        expected = os.path.relpath(self.launcher, self.site)
+        variants = (
+            expected.replace("fixture-cli", "unapproved-cli"),
+            "../bin/../bin/fixture-cli",
+            str(self.launcher),
+        )
+        with patch.object(sysconfig, "get_path", return_value=str(self.scripts)):
+            for name in variants:
+                with self.subTest(record_path=name):
+                    record.write_text(original.replace(expected, name), encoding="utf-8")
+                    manifest["files"][str(record.relative_to(WORKSPACE))] = sha256(record.read_bytes()).hexdigest()
+                    with self.assertRaises(ValueError):
+                        self._validate(self._seal(manifest))
+
+    def test_production_rejects_missing_or_symlink_console_launcher(self):
+        manifest = self._console_manifest()
+        original = self.launcher.read_bytes()
+        self.launcher.unlink()
+        with patch.object(sysconfig, "get_path", return_value=str(self.scripts)):
+            with self.assertRaises((OSError, ValueError)):
+                self._validate(manifest)
+            target = self.scripts / "other-cli"
+            target.write_bytes(original)
+            self.launcher.symlink_to(target)
+            with self.assertRaises(ValueError):
+                self._validate(manifest)
+
+    def test_production_rejects_missing_or_duplicate_console_record_entry(self):
+        manifest = self._console_manifest()
+        record = self.site / DIST_INFO / "RECORD"
+        original = record.read_text(encoding="utf-8")
+        row = os.path.relpath(self.launcher, self.site) + ",,\n"
+        with patch.object(sysconfig, "get_path", return_value=str(self.scripts)):
+            for contents in (original.replace(row, ""), original + row):
+                with self.subTest(record=contents):
+                    record.write_text(contents, encoding="utf-8")
+                    manifest["files"][str(record.relative_to(WORKSPACE))] = sha256(record.read_bytes()).hexdigest()
+                    with self.assertRaises(ValueError):
+                        self._validate(self._seal(manifest))
 
     def test_production_rejects_arbitrary_bytes_with_a_wheel_name(self):
         self.wheel.write_bytes(b"not a ZIP wheel")

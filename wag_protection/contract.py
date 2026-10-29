@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 import base64
 import binascii
 import csv
+import configparser
 import email.message
 import hashlib
 import importlib.metadata
@@ -15,6 +16,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import sysconfig
 from typing import Literal, NotRequired, TypeGuard, TypedDict, cast
 import zipfile
 
@@ -391,7 +393,59 @@ def _wheel_payload(path):
     return payload
 
 
-def _installed_payload(distribution):
+def _wheel_console_launchers(wheel_payload, distribution):
+    metadata_name = next(name for name in wheel_payload if name.endswith('.dist-info/METADATA'))
+    entry_name = str(Path(metadata_name).with_name('entry_points.txt'))
+    if entry_name not in wheel_payload:
+        return {}
+    parser = configparser.ConfigParser(interpolation=None)
+    parser.optionxform = str
+    try:
+        parser.read_string(wheel_payload[entry_name][2].decode('utf-8'))
+    except (UnicodeError, configparser.Error) as error:
+        raise ValueError('invalid wheel entry points') from error
+    if not parser.has_section('console_scripts'):
+        return {}
+    declarations = dict(parser.items('console_scripts', raw=True))
+    if not declarations:
+        return {}
+    scripts = canonical_path(sysconfig.get_path('scripts'))
+    root = canonical_path(distribution.locate_file(''))
+    python = sys.executable
+    if (not Path(python).is_absolute() or str(Path(python)) != python
+            or any(char.isspace() for char in python)):
+        raise ValueError('unsupported launcher interpreter')
+    identifier = r'[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*'
+    launchers = {}
+    for name, value in declarations.items():
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', name):
+            raise ValueError('invalid wheel console script')
+        entry = re.fullmatch(f'({identifier}):({identifier})', value.strip())
+        if entry is None:
+            raise ValueError('unsupported wheel console script')
+        module, attribute = entry.groups()
+        target = scripts / name
+        relative = os.path.relpath(target, root)
+        if relative in wheel_payload:
+            raise ValueError('wheel launcher collision')
+        # Only this reviewed Linux pip/distlib transformation is supported.
+        # Its entire body is bound to the wheel entry point and interpreter;
+        # never follow an arbitrary RECORD traversal or execute a launcher.
+        contents = (
+            f'#!{python}\n'
+            '# -*- coding: utf-8 -*-\n'
+            'import re\n'
+            'import sys\n'
+            f'from {module} import {attribute.split(".")[0]}\n'
+            "if __name__ == '__main__':\n"
+            "    sys.argv[0] = re.sub(r'(-script\\.pyw|\\.exe)?$', '', sys.argv[0])\n"
+            f'    sys.exit({attribute}())\n'
+        ).encode('utf-8')
+        launchers[relative] = (target, contents)
+    return launchers
+
+
+def _installed_payload(distribution, launchers):
     record = distribution.read_text('RECORD')
     if not record:
         raise ValueError('missing installed record')
@@ -401,14 +455,21 @@ def _installed_payload(distribution):
         if len(row) != 3:
             raise ValueError('invalid installed record')
         name, digest, size = row
-        relative = _safe_dependency_path(name)
-        raw_path = root / relative
+        if name in payload:
+            raise ValueError('duplicate installed record')
+        if name in launchers:
+            raw_path = launchers[name][0]
+        else:
+            relative = _safe_dependency_path(name)
+            raw_path = root / relative
         if raw_path.is_symlink() or not raw_path.is_file():
             raise ValueError('invalid installed payload')
         path = canonical_path(raw_path)
-        if root not in path.parents or not path.is_file():
+        if (name not in launchers and root not in path.parents) or not path.is_file():
             raise ValueError('invalid installed payload')
         contents = path.read_bytes()
+        if name in launchers and contents != launchers[name][1]:
+            raise ValueError('installed launcher mismatch')
         if digest and hashlib.sha256(contents).hexdigest() != _record_digest(digest):
             raise ValueError('installed payload mismatch')
         if size and (not size.isdigit() or int(size) != len(contents)):
@@ -474,13 +535,16 @@ def _validate_dependency_provenance(distributions, wheels, files, mode):
         wheel_payload = _wheel_payload(canonical_path(Path(__file__).resolve().parent.parent / wheel_path))
         _validate_wheel_metadata(name, wheel_payload, distribution, version)
         installed_distribution = installed[distribution][1]
-        installed_payload = _installed_payload(installed_distribution)
-        if not set(wheel_payload).issubset(installed_payload):
+        launchers = _wheel_console_launchers(wheel_payload, installed_distribution)
+        installed_payload = _installed_payload(installed_distribution, launchers)
+        if not (set(wheel_payload) | set(launchers)).issubset(installed_payload):
             raise ValueError('installed payload mismatch')
         metadata_name = next(path for path in wheel_payload if path.endswith('.dist-info/METADATA'))
         record_name = str(Path(metadata_name).with_name('RECORD'))
         module_root = canonical_path(Path(__file__).resolve().parent.parent)
         for payload_name, (digest, size, _) in installed_payload.items():
+            if payload_name in launchers:
+                continue
             if payload_name in wheel_payload and payload_name != record_name:
                 if wheel_payload[payload_name][:2] != (digest, size):
                     raise ValueError('installed payload mismatch')
