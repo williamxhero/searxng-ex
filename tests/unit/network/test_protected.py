@@ -237,7 +237,7 @@ class ProtectedTransportTest(unittest.TestCase):  # pylint: disable=too-many-pub
             patch.object(protected, 'open_store', return_value=store) as open_store,
             patch.object(protected, 'resolved_config_digest', return_value='resolved'),
         ):
-            self.assertIs(protected._validated_store(config, {}), store)
+            self.assertIs(protected._validated_store(config, {'engines': [], 'outgoing': {}}), store)
         open_store.assert_called_once_with(str(self.root), manifest={'mode': 'production'}, mode='production')
 
     def stop_server(self):
