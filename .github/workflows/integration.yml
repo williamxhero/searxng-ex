@@ -6,9 +6,11 @@ on:
   push:
     branches:
       - master
+      - wag-production
   pull_request:
     branches:
       - master
+      - wag-production
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}
@@ -42,6 +44,8 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: "false"
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Setup cache Python
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
@@ -54,8 +58,119 @@ jobs:
       - name: Setup venv
         run: make V=1 install
 
+      - name: Provision test tools before network isolation
+        run: make V=1 gecko.driver go.env.dev test.shfmt
+
       - name: Run tests
-        run: make V=1 ci.test
+        env:
+          TMPDIR: ${{ github.workspace }}/local/tmp
+          PYTHONDONTWRITEBYTECODE: "1"
+          WAG_EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          MOZ_ALLOW_ROOT: "1"
+          MOZ_DISABLE_CONTENT_SANDBOX: "1"
+        run: |
+          mkdir -p "$TMPDIR"
+          runner_uid="$(id -u)"
+          if sudo -n true 2>/dev/null; then
+            sudo -n env \
+              "HOME=$HOME" \
+              "TMPDIR=$TMPDIR" \
+              "PYTHONDONTWRITEBYTECODE=$PYTHONDONTWRITEBYTECODE" \
+              "WAG_EXPECTED_HEAD=$WAG_EXPECTED_HEAD" \
+              "WAG_RUNNER_UID=$runner_uid" \
+              "MOZ_ALLOW_ROOT=$MOZ_ALLOW_ROOT" \
+              "MOZ_DISABLE_CONTENT_SANDBOX=$MOZ_DISABLE_CONTENT_SANDBOX" \
+              "PATH=$PATH" \
+              unshare --net -- \
+              sh -c '
+                set -eu
+                ip link set lo up
+                setpriv --reuid 0 --regid 1000 --clear-groups -- \
+                  local/py3/bin/python -m tests.unit.test_wag_protection --make test.unit
+                setpriv --reuid 0 --regid 1000 --clear-groups -- \
+                  make V=1 \
+                    test.yamllint test.black test.pyright_modified \
+                    test.pylint test.rst test.shell test.shfmt test.pybabel
+                setpriv --reuid 0 --regid 1000 --clear-groups -- \
+                  env SEARXNG_SETTINGS_PATH="$PWD/tests/robot/settings_robot.yml" \
+                  local/py3/bin/python searx/webapp.py > "$TMPDIR/robot-server.log" 2>&1 &
+                server_pid=$!
+                trap "kill $server_pid 2>/dev/null || true; wait $server_pid 2>/dev/null || true" EXIT
+                for _ in $(seq 1 50); do
+                  if curl --fail --silent http://127.0.0.1:11111/ >/dev/null; then
+                    break
+                  fi
+                  sleep 0.1
+                done
+                if ! curl --fail --silent http://127.0.0.1:11111/ >/dev/null; then
+                  cat "$TMPDIR/robot-server.log"
+                  exit 1
+                fi
+                setpriv --reuid "$WAG_RUNNER_UID" --regid 1000 --clear-groups -- \
+                  env SEARXNG_ROBOT_EXTERNAL_SERVER=1 make V=1 test.robot
+                git diff --exit-code HEAD
+              '
+          else
+            unshare --user --map-user=0 --map-group=1000 --net -- \
+              local/py3/bin/python -m tests.unit.test_wag_protection --make ci.test
+          fi
+
+  protection:
+    name: Offline protection exact HEAD
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Checkout exact HEAD
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: "false"
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Provision locked native dependencies
+        run: |
+          python -m venv local/protection-venv
+          local/protection-venv/bin/python -m pip install --require-hashes -r requirements-protection.lock
+
+      - name: Offline native positive and regression gate
+        env:
+          TMPDIR: ${{ github.workspace }}/local/tmp
+          PYTHONDONTWRITEBYTECODE: "1"
+          WAG_EXPECTED_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+          MOZ_ALLOW_ROOT: "1"
+          MOZ_DISABLE_CONTENT_SANDBOX: "1"
+        run: |
+          mkdir -p "$TMPDIR"
+          set -o pipefail
+          if unshare --user --map-user=0 --map-group=1000 --net -- true 2>/dev/null; then
+            unshare --user --map-user=0 --map-group=1000 --net -- \
+              local/protection-venv/bin/python -m tests.unit.test_wag_protection --offline \
+              2>&1 | tee local/protection-offline.log
+          else
+            sudo -n env \
+              "TMPDIR=$TMPDIR" \
+              "PYTHONDONTWRITEBYTECODE=$PYTHONDONTWRITEBYTECODE" \
+              "WAG_EXPECTED_HEAD=$WAG_EXPECTED_HEAD" \
+              "MOZ_ALLOW_ROOT=$MOZ_ALLOW_ROOT" \
+              "MOZ_DISABLE_CONTENT_SANDBOX=$MOZ_DISABLE_CONTENT_SANDBOX" \
+              "PATH=$PATH" \
+              unshare --net -- \
+              setpriv --reuid 0 --regid 1000 --clear-groups -- \
+              local/protection-venv/bin/python -m tests.unit.test_wag_protection --offline \
+              2>&1 | tee local/protection-offline.log
+          fi
+
+      - name: Preserve offline evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: protection-${{ github.event.pull_request.head.sha || github.sha }}
+          path: local/protection-offline.log
+          if-no-files-found: error
 
   theme:
     name: Theme
@@ -76,6 +191,8 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: "false"
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Setup cache Python
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0

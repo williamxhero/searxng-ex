@@ -129,6 +129,21 @@ class SettingsDirectoryValue(SettingsValue):
         return super().__call__(value)
 
 
+class SettingsProtectionValue(SettingsValue):
+    """Keep protection's raw booleans and unknown keys strict."""
+
+    @override
+    def __call__(self, value: t.Any) -> t.Any:
+        if value is _UNDEFINED:
+            value = self.default
+        if isinstance(value, dict) and set(value) == {'enabled'} and value['enabled'] is False:
+            return {'enabled': False}
+
+        from wag_protection import validate_settings  # pylint: disable=import-outside-toplevel
+
+        return validate_settings(value)
+
+
 class SettingsBytesValue(SettingsValue):
     """str are base64 decoded"""
 
@@ -247,6 +262,7 @@ SCHEMA: dict[str, t.Any] = {
     },
     "preferences": SettingsPref,
     'outgoing': {
+        'wag_protection': SettingsProtectionValue(dict, {'enabled': False}),
         'useragent_suffix': SettingsValue(str, ''),
         'request_timeout': SettingsValue(numbers.Real, 3.0),
         'enable_http2': SettingsValue(bool, True),

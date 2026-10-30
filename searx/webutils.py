@@ -170,6 +170,9 @@ def get_json_response(sq: "SearchQuery", rc: "ResultContainer") -> str:
         'suggestions': list(rc.suggestions),
         'unresponsive_engines': get_translated_errors(rc.unresponsive_engines),
     }
+    snapshot = rc.outbound_protection
+    if isinstance(snapshot, dict):
+        data['outbound_protection'] = snapshot
     response = json.dumps(data, cls=JSONEncoder)
     return response
 

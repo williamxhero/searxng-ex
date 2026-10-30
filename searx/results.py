@@ -4,6 +4,7 @@
 import typing as t
 
 import warnings
+import json
 from collections import defaultdict
 from threading import RLock
 
@@ -78,8 +79,26 @@ class ResultContainer:
         self.on_result: t.Callable[[Result | LegacyResult], bool] = lambda _: True
         self._lock: RLock = RLock()
         self._main_results_sorted: list[MainResult | LegacyResult] = None  # type: ignore
+        self._outbound_protection: str | None = None
 
-    def extend(
+    @property
+    def outbound_protection(self):
+        with self._lock:
+            return json.loads(self._outbound_protection) if self._outbound_protection is not None else None
+
+    def set_outbound_protection(self, snapshot):
+        # Publish once, detached from worker and caller-owned mutable objects.
+        encoded = json.dumps(snapshot, allow_nan=False, sort_keys=True)
+        with self._lock:
+            if self._closed or self._outbound_protection is not None:
+                raise RuntimeError('protection snapshot already sealed')
+            self._outbound_protection = encoded
+
+    def extend(self, engine_name: str | None, results: list[Result | LegacyResult]):
+        with self._lock:
+            self._extend(engine_name, results)
+
+    def _extend(
         self, engine_name: str | None, results: list[Result | LegacyResult]
     ):  # pylint: disable=too-many-branches
         if self._closed:
@@ -181,12 +200,15 @@ class ResultContainer:
             merged.positions.append(position)
 
     def close(self):
-        self._closed = True
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
 
-        for result in self.main_results_map.values():
-            result.score = calculate_score(result, result.priority)
-            for eng_name in result.engines:
-                counter_add(result.score, 'engine', eng_name, 'score')
+            for result in self.main_results_map.values():
+                result.score = calculate_score(result, result.priority)
+                for eng_name in result.engines:
+                    counter_add(result.score, 'engine', eng_name, 'score')
 
     def get_ordered_results(self) -> list[MainResult | LegacyResult]:
         """Returns a sorted list of results to be displayed in the main result

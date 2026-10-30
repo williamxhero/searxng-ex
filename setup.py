@@ -43,6 +43,8 @@ setup(
     },
     packages=find_packages(
         include=[
+            'wag_protection',
+            'wag_protection.*',
             'searx',
             'searx.*',
             'searx.*.*',

@@ -4,10 +4,22 @@
 import mock
 from parameterized.parameterized import parameterized
 from searx import webutils
+from searx.results import ResultContainer
+from searx.search.models import SearchQuery
 from tests import SearxTestCase
 
 
 class TestWebUtils(SearxTestCase):
+
+    def test_json_off_preserves_exact_existing_payload(self):
+        query = SearchQuery('offline compatibility', [])
+        response = webutils.get_json_response(query, ResultContainer())
+        self.assertEqual(
+            response,
+            '{"query": "offline compatibility", "results": [], "answers": [], '
+            '"corrections": [], "infoboxes": [], "suggestions": [], '
+            '"unresponsive_engines": []}',
+        )
 
     @parameterized.expand(
         [

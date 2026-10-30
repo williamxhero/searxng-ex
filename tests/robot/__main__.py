@@ -30,15 +30,21 @@ class SearxRobotLayer:
         # set robot settings path
         os.environ['SEARXNG_SETTINGS_PATH'] = str(tests_path / 'robot' / 'settings_robot.yml')
 
+        # The CI protection gate can provide a root-owned server while the browser runs as the runner user.
+        if os.environ.get("SEARXNG_ROBOT_EXTERNAL_SERVER") == "1":
+            self.server = None
+            return
+
         # run the server
         self.server = subprocess.Popen(  # pylint: disable=consider-using-with
             [exe, webapp], stdout=subprocess.PIPE, stderr=subprocess.STDOUT
         )
-        if hasattr(self.server.stdout, 'read1'):
+        if hasattr(self.server.stdout, "read1"):
             print(self.server.stdout.read1(1024).decode())
 
     def tearDown(self):
-        os.kill(self.server.pid, 9)
+        if self.server is not None:
+            os.kill(self.server.pid, 9)
         # remove previously set environment variable
         del os.environ['SEARXNG_SETTINGS_PATH']
 

@@ -36,6 +36,12 @@ def initialize(
     enable_metrics: bool = True,
 ):
     settings_engines = settings_engines or settings['engines']
+    if settings['outgoing'].get('wag_protection', {}).get('enabled', False) is not False:
+        from searx.network.protected import validate_engine_settings  # pylint: disable=import-outside-toplevel
+
+        for engine_data in settings_engines:
+            if not engine_data.get('inactive', False):
+                validate_engine_settings(engine_data)
     load_engines(settings_engines)
     initialize_network(settings_engines, settings['outgoing'])
     if check_network:
@@ -55,6 +61,20 @@ class Search:
         self.result_container: ResultContainer = ResultContainer()
         self.start_time: float | None = None
         self.actual_timeout: float | None = None
+        self._protection_lock = threading.Lock()
+        self._protection_cancelled = False
+        self._protection_observer = None
+
+    @property
+    def outbound_protection(self):
+        return self.result_container.outbound_protection
+
+    def cancel(self):
+        """Notify this Search's protected worker; never touch its ledger or lock."""
+        with self._protection_lock:
+            self._protection_cancelled = True
+            if self._protection_observer is not None:
+                self._protection_observer.cancel()
 
     def search_external_bang(self) -> bool:
         """Check if there is a external bang.  If yes, update
@@ -157,10 +177,188 @@ class Search:
                     self.result_container.add_unresponsive_engine(th._engine_name, 'timeout')
                     PROCESSORS[th._engine_name].logger.error('engine timeout')
 
+    def _search_protected(self, store, requests):
+        from wag_protection import Refusal  # pylint: disable=import-outside-toplevel
+
+        aliases = (
+            {}
+            if isinstance(store, Refusal)
+            else {alias: entry['engine'] for entry in store.manifest['registry'] for alias in entry['aliases']}
+        )
+        refs = []
+        for engineref in sorted(
+            self.search_query.engineref_list, key=lambda ref: (aliases.get(ref.name, ref.name), ref.category)
+        ):
+            ref = {
+                'engine': aliases.get(engineref.name, engineref.name),
+                'category': engineref.category,
+                'status': 'refused',
+                'reason': None,
+                'outcome': None,
+                'reservations': 0,
+                'connection_attempts': None,
+                'http_attempts': None,
+                'result_count': None,
+                'elapsed_s': None,
+                'deadline_exceeded': False,
+            }
+            refs.append(ref)
+            if isinstance(store, Refusal):
+                ref['reason'] = store.reason
+                continue
+            processor = PROCESSORS.get(engineref.name)
+            params = next(
+                (
+                    params
+                    for name, _, params in requests
+                    if name == engineref.name and params['category'] == engineref.category
+                ),
+                None,
+            )
+            if processor is None or not hasattr(processor, 'search_protected'):
+                ref['reason'] = 'capability_refused'
+                continue
+            if processor.suspended_status.is_suspended:
+                ref['reason'] = 'cooldown'
+                continue
+            if params is None:
+                ref.update(status='skipped')
+                continue
+            remaining = self.start_time + self.actual_timeout - default_timer()
+            if remaining <= 0:
+                ref.update(reason='deadline_exceeded', deadline_exceeded=True)
+                continue
+            outcome, observer = self._run_protected_request(store, processor, params)
+            if observer is None:
+                ref.update(reason='cancelled')
+                continue
+            if outcome is None:
+                ref.update(
+                    status='unfinished',
+                    reason='unfinished_attempt',
+                    reservations=observer.reservations,
+                    deadline_exceeded=True,
+                )
+                continue
+            if isinstance(outcome, Refusal):
+                ref['reason'] = outcome.reason
+                if outcome.reason == 'unfinished_attempt':
+                    ref.update(status='unfinished', reservations=observer.reservations, deadline_exceeded=True)
+                continue
+            ref.update(
+                status='admitted',
+                outcome=outcome.outcome,
+                reservations=outcome.reservations,
+                connection_attempts=outcome.connection_attempts,
+                http_attempts=outcome.http_attempts,
+                result_count=outcome.result_count,
+                elapsed_s=outcome.elapsed_s,
+                deadline_exceeded=outcome.deadline_exceeded,
+            )
+            if outcome.outcome in ('ok', 'empty'):
+                processor.extend_container(self.result_container, self.start_time, outcome.results)
+            else:
+                self.result_container.add_unresponsive_engine(engineref.name, outcome.outcome)
+        self._publish_protected_snapshot(store, refs)
+
+    def _run_protected_request(self, store, processor, params):
+        """Own one observer/thread lifecycle without releasing its worker's lock."""
+        from wag_protection import DispatchNotification, Refusal  # pylint: disable=import-outside-toplevel
+
+        completed = []
+        observer = DispatchNotification()
+        with self._protection_lock:
+            if self._protection_cancelled:
+                # No dispatch was scheduled; retain the existing ref-level reason.
+                return None, None
+            self._protection_observer = observer
+
+        def work(processor, params, completed, observer):
+            try:
+                completed.append(
+                    processor.search_protected(
+                        self.search_query.query,
+                        params,
+                        store,
+                        self.start_time,
+                        self.actual_timeout,
+                        observer=observer,
+                    )
+                )
+            # Keep arbitrary engine exception text out of machine evidence.
+            except Exception:  # pylint: disable=broad-exception-caught
+                completed.append(Refusal('storage_error'))
+
+        thread = threading.Thread(
+            target=copy_current_request_context(work), args=(processor, params, completed, observer), daemon=True
+        )
+        try:
+            thread.start()
+            thread.join(max(0, self.start_time + self.actual_timeout - default_timer()))
+        except BaseException:
+            observer.notify()
+            raise
+        finally:
+            with self._protection_lock:
+                self._protection_observer = None
+        if thread.is_alive():
+            # Its worker retains the flock/DB and seals unfinished state.
+            return observer.notify(), observer
+        return completed[0], observer
+
+    def _publish_protected_snapshot(self, store, refs):
+        """Publish sealed machine evidence without performing engine work."""
+        from wag_protection import Refusal  # pylint: disable=import-outside-toplevel
+
+        if all(
+            (ref['status'] == 'admitted' and ref['outcome'] in ('ok', 'empty'))
+            or (ref['status'] == 'skipped' and ref['reason'] is None)
+            for ref in refs
+        ):
+            status = 'complete'
+        elif any(ref['status'] == 'unfinished' for ref in refs):
+            status = 'unfinished'
+        elif any(ref['status'] == 'admitted' for ref in refs):
+            status = 'partial'
+        else:
+            status = 'refused'
+        from searx.network.protected import (  # pylint: disable=import-outside-toplevel
+            protection_descriptor,
+            resolved_config_digest,
+        )
+
+        manifest = protection_descriptor() if isinstance(store, Refusal) else store.manifest
+        self.result_container.set_outbound_protection(
+            {
+                'version': 2,
+                'enabled': True,
+                'contract': 'wag.outbound.v2',
+                'artifact_digest': manifest.get('artifact_digest'),
+                'registry_digest': manifest.get('registry_digest'),
+                'config_digest': resolved_config_digest(settings['engines'], settings['outgoing']),
+                'status': status,
+                'retryable': status == 'complete',
+                'engines': refs,
+            }
+        )
+
     def search_standard(self):
         """
         Update self.result_container, self.actual_timeout
         """
+        if settings['outgoing'].get('wag_protection', {}).get('enabled', False) is not False:
+            from wag_protection import Refusal  # pylint: disable=import-outside-toplevel
+            from searx.network.protected import get_store  # pylint: disable=import-outside-toplevel
+
+            store = get_store()
+            if isinstance(store, Refusal):
+                self.actual_timeout = 0
+                self._search_protected(store, [])
+            else:
+                requests, self.actual_timeout = self._get_requests()
+                self.actual_timeout = min(self.actual_timeout, 3.0)
+                self._search_protected(store, requests)
+            return True
         requests, self.actual_timeout = self._get_requests()
 
         # send all search-request

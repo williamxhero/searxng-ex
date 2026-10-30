@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # pylint: disable=missing-module-docstring,disable=missing-class-docstring,invalid-name
 
+import subprocess
+import sys
+
 from searx import settings, engines
 from tests import SearxTestCase
 
@@ -17,6 +20,24 @@ class TestEnginesInit(SearxTestCase):
         self.assertEqual(len(engines.engines), 2)
         self.assertIn('engine1', engines.engines)
         self.assertIn('engine2', engines.engines)
+
+    def test_load_engine_off_does_not_import_protection(self):
+        script = """
+import sys
+
+class DenyProtectionImports:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split('.')[0] == 'wag_protection' or fullname == 'searx.network.protected':
+            raise AssertionError('off-mode imported ' + fullname)
+
+sys.meta_path.insert(0, DenyProtectionImports())
+from searx import settings, engines
+settings['outgoing']['wag_protection'] = {'enabled': False}
+engine = engines.load_engine({'name': 'dummy', 'engine': 'dummy'})
+assert engine is not None
+"""
+        result = subprocess.run([sys.executable, '-c', script], capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_initialize_engines_exclude_onions(self):
         settings['outgoing']['using_tor_proxy'] = False

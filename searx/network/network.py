@@ -6,11 +6,13 @@ __all__ = ["get_network"]
 
 import typing as t
 from collections.abc import Generator
+from contextlib import asynccontextmanager, contextmanager
 
 
 import atexit
 import asyncio
 import ipaddress
+import threading
 from itertools import cycle
 
 import httpx
@@ -24,6 +26,8 @@ from .raise_for_httperror import raise_for_httperror
 logger = logger.getChild('network')
 DEFAULT_NAME = '__DEFAULT__'
 NETWORKS: dict[str, "Network"] = {}
+_INITIALIZE_LOCK = threading.Lock()
+_REGISTRY_LOCK = threading.Lock()
 # requests compatibility when reading proxy settings from settings.yml
 PROXY_PATTERN_MAPPING = {
     'http': 'http://',
@@ -39,6 +43,41 @@ PROXY_PATTERN_MAPPING = {
 }
 
 ADDRESS_MAPPING = {'ipv4': '0.0.0.0', 'ipv6': '::'}
+
+
+class _NetworkLifecycle:
+    """Admission and drain state, owned exclusively by the HTTP event loop."""
+
+    def __init__(self):
+        self.tasks = {}
+        self.idle = asyncio.Event()
+        self.idle.set()
+        self.draining = False
+        self.close_lock = asyncio.Lock()
+        self.client_lock = asyncio.Lock()
+
+    def begin_drain(self):
+        self.draining = True
+
+    def check_close_owner(self):
+        if asyncio.current_task() in self.tasks:
+            raise RuntimeError('cannot close a network from its active operation')
+
+    @contextmanager
+    def lease(self):
+        task = asyncio.current_task()
+        if self.draining:
+            raise RuntimeError('network generation is draining')
+        self.tasks[task] = self.tasks.get(task, 0) + 1
+        self.idle.clear()
+        try:
+            yield
+        finally:
+            self.tasks[task] -= 1
+            if not self.tasks[task]:
+                del self.tasks[task]
+            if not self.tasks:
+                self.idle.set()
 
 
 @t.final
@@ -60,7 +99,9 @@ class Network:
         '_local_addresses_cycle',
         '_proxies_cycle',
         '_clients',
+        '_lifecycle',
         '_logger',
+        'protected',
     )
 
     _TOR_CHECK_RESULT = {}
@@ -81,8 +122,10 @@ class Network:
         retry_on_http_error: bool = False,
         max_redirects: int = 30,
         logger_name: str = None,  # pyright: ignore[reportArgumentType]
+        protected: bool = False,
     ):
 
+        self.protected = protected
         self.enable_http = enable_http
         self.verify = verify
         self.enable_http2 = enable_http2
@@ -98,10 +141,18 @@ class Network:
         self._local_addresses_cycle = self.get_ipaddress_cycle()
         self._proxies_cycle = self.get_proxy_cycles()
         self._clients = {}
+        self._lifecycle = _NetworkLifecycle()
         self._logger = logger.getChild(logger_name) if logger_name else logger
         self.check_parameters()
 
     def check_parameters(self):
+        if self.protected:
+            from wag_protection import ProtectionError  # pylint: disable=import-outside-toplevel
+
+            if self.using_tor_proxy or any(
+                httpx.URL(url).scheme not in ('http', 'https') for _, urls in self.iter_proxies() for url in urls
+            ):
+                raise ProtectionError('route_unsupported')
         for address in self.iter_ipaddresses():
             if '/' in address:
                 ipaddress.ip_network(address, False)
@@ -188,12 +239,36 @@ class Network:
         return result
 
     async def get_client(self, verify: bool | None = None, max_redirects: int | None = None) -> httpx.AsyncClient:
+        with self._lifecycle.lease():
+            return await self._get_client(verify, max_redirects)
+
+    async def _get_client(self, verify=None, max_redirects=None):
+        # Internal retries belong to the already-admitted operation, not a new lease.
+        async with self._lifecycle.client_lock:
+            return await self._create_client(verify, max_redirects)
+
+    async def _create_client(self, verify, max_redirects):
+        if self.protected and self.using_tor_proxy:
+            from wag_protection import ProtectionError  # pylint: disable=import-outside-toplevel
+
+            raise ProtectionError('route_unsupported')
+
+        from searx import settings  # pylint: disable=import-outside-toplevel
+
+        if settings['outgoing'].get('wag_protection', {}).get('enabled', False) is not False and not self.protected:
+            from wag_protection import ProtectionError  # pylint: disable=import-outside-toplevel
+
+            raise ProtectionError('capability_refused')
+        if self.protected:
+            from .protected import _dispatch  # pylint: disable=import-outside-toplevel
+
+            _dispatch()
         verify = self.verify if verify is None else verify
         max_redirects = self.max_redirects if max_redirects is None else max_redirects
         local_address = next(self._local_addresses_cycle)
         proxies = next(self._proxies_cycle)  # is a tuple so it can be part of the key
         key = (verify, max_redirects, local_address, proxies)
-        hook_log_response = self.log_response if sxng_debug else None
+        hook_log_response = self.log_response if sxng_debug and not self.protected else None
         if key not in self._clients or self._clients[key].is_closed:
             client = new_client(
                 self.enable_http,
@@ -207,21 +282,36 @@ class Network:
                 0,
                 max_redirects,
                 hook_log_response,
+                protected=self.protected,
             )
-            if self.using_tor_proxy and not await self.check_tor_proxy(client, proxies):
-                await client.aclose()
-                raise httpx.ProxyError('Network configuration problem: not using Tor')
+            try:
+                if self.using_tor_proxy and not await self.check_tor_proxy(client, proxies):
+                    raise httpx.ProxyError('Network configuration problem: not using Tor')
+            except BaseException:
+                # Keep ownership even if cancellation or client cleanup also fails.
+                self._clients[key] = client
+                try:
+                    await client.aclose()
+                except BaseException:
+                    self._lifecycle.begin_drain()
+                    raise
+                raise
             self._clients[key] = client
         return self._clients[key]
 
     async def aclose(self):
-        async def close_client(client):
-            try:
-                await client.aclose()
-            except httpx.HTTPError:
-                pass
-
-        await asyncio.gather(*[close_client(client) for client in self._clients.values()], return_exceptions=False)
+        # Retirement is irreversible, including cancellation/partial close failure.
+        self._lifecycle.check_close_owner()
+        self._lifecycle.begin_drain()
+        async with self._lifecycle.close_lock:
+            await self._lifecycle.idle.wait()
+            results = await asyncio.gather(
+                *[client.aclose() for client in self._clients.values()], return_exceptions=True
+            )
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
+            self._clients.clear()
 
     @staticmethod
     def extract_kwargs_clients(kwargs: dict[str, t.Any]) -> dict[str, t.Any]:
@@ -269,13 +359,44 @@ class Network:
             return False
         return True
 
+    async def _call_protected_client(self, stream: bool, method: str, url: str, **kwargs: t.Any) -> SXNG_Response:
+        from wag_protection import EngineFailure, ProtectionError  # pylint: disable=import-outside-toplevel
+        from .protected import _dispatch  # pylint: disable=import-outside-toplevel
+
+        _dispatch()
+        if stream:
+            raise ProtectionError('helper_refused')
+        do_raise = Network.extract_do_raise_for_httperror(kwargs)
+        kwargs_clients = Network.extract_kwargs_clients(kwargs)
+        kwargs['follow_redirects'] = False
+        client = await self._get_client(**kwargs_clients)
+        client.cookies = httpx.Cookies(kwargs.pop('cookies', None))
+        try:
+            response = await client.request(method, url, **kwargs)
+        except httpx.TimeoutException:
+            raise EngineFailure('timeout') from None
+        if 300 <= response.status_code < 400:
+            raise EngineFailure('redirect_refused')
+        response.ok = not response.is_error
+        if do_raise:
+            raise_for_httperror(response)
+        return response
+
     async def call_client(self, stream: bool, method: str, url: str, **kwargs: t.Any) -> SXNG_Response:
+        if stream:
+            return self._stream_context(method, url, **kwargs)
+        with self._lifecycle.lease():
+            return await self._call_client(False, method, url, **kwargs)
+
+    async def _call_client(self, stream: bool, method: str, url: str, **kwargs: t.Any) -> SXNG_Response:
+        if self.protected:
+            return await self._call_protected_client(stream, method, url, **kwargs)
         retries = self.retries
         was_disconnected = False
         do_raise_for_httperror = Network.extract_do_raise_for_httperror(kwargs)
         kwargs_clients = Network.extract_kwargs_clients(kwargs)
         while retries >= 0:  # pragma: no cover
-            client = await self.get_client(**kwargs_clients)
+            client = await self._get_client(**kwargs_clients)
             cookies = kwargs.pop("cookies", None)
             client.cookies = httpx.Cookies(cookies)
             try:
@@ -303,16 +424,34 @@ class Network:
     async def request(self, method: str, url: str, **kwargs: t.Any) -> SXNG_Response:
         return await self.call_client(False, method, url, **kwargs)
 
+    @asynccontextmanager
+    async def _stream_context(self, method: str, url: str, **kwargs):
+        with self._lifecycle.lease():
+            async with await self._call_client(True, method, url, **kwargs) as response:
+                yield response
+
     async def stream(self, method: str, url: str, **kwargs):
         return await self.call_client(True, method, url, **kwargs)
 
     @classmethod
-    async def aclose_all(cls):
-        await asyncio.gather(*[network.aclose() for network in NETWORKS.values()], return_exceptions=False)
+    async def aclose_all(cls, networks=None):
+        # pylint: disable=protected-access
+        networks = list(dict.fromkeys(NETWORKS.values() if networks is None else networks))
+        # Check every owner before retiring any peer, then close admission before awaiting.
+        for network in networks:
+            network._lifecycle.check_close_owner()
+        for network in networks:
+            network._lifecycle.begin_drain()
+        await asyncio.gather(*[network._lifecycle.idle.wait() for network in networks])
+        results = await asyncio.gather(*[network.aclose() for network in networks], return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
 
 
 def get_network(name: str | None = None) -> "Network":
-    return NETWORKS.get(name or DEFAULT_NAME)  # pyright: ignore[reportReturnType]
+    with _REGISTRY_LOCK:
+        return NETWORKS.get(name or DEFAULT_NAME)  # pyright: ignore[reportReturnType]
 
 
 def check_network_configuration():
@@ -337,6 +476,12 @@ def initialize(
     settings_engines: list[dict[str, t.Any]] = None,  # pyright: ignore[reportArgumentType]
     settings_outgoing: dict[str, t.Any] = None,  # pyright: ignore[reportArgumentType]
 ) -> None:
+    # Serialize reloads without holding the short registry lock across draining.
+    with _INITIALIZE_LOCK:
+        _initialize(settings_engines, settings_outgoing)
+
+
+def _initialize(settings_engines, settings_outgoing):
     # pylint: disable=import-outside-toplevel)
     from searx.engines import engines
     from searx import settings
@@ -345,9 +490,10 @@ def initialize(
 
     settings_engines = settings_engines or settings['engines']
     settings_outgoing = settings_outgoing or settings['outgoing']
+    protection_enabled = settings_outgoing.get('wag_protection', {}).get('enabled') is True
 
-    # default parameters for AsyncHTTPTransport
-    # see https://github.com/encode/httpx/blob/e05a5372eb6172287458b37447c30f650047e1b8/httpx/_transports/default.py#L108-L121  # pylint: disable=line-too-long
+    # Default parameters for AsyncHTTPTransport. See its implementation for the
+    # corresponding defaults in the pinned httpx dependency.
     default_params: dict[str, t.Any] = {
         'enable_http': False,
         'verify': settings_outgoing['verify'],
@@ -368,6 +514,8 @@ def initialize(
         result = {}
         result.update(default_params)  # pyright: ignore[reportUnknownMemberType]
         result.update(params)  # pyright: ignore[reportUnknownMemberType]
+        if protection_enabled:
+            result['protected'] = True
         if logger_name:
             result['logger_name'] = logger_name
         return Network(**result)  # type: ignore
@@ -382,16 +530,14 @@ def initialize(
             network = getattr(engine, 'network', None)
             yield engine_name, engine, network
 
-    if NETWORKS:
-        done()
-    NETWORKS.clear()
-    NETWORKS[DEFAULT_NAME] = new_network({}, logger_name='default')
-    NETWORKS['ipv4'] = new_network({'local_addresses': '0.0.0.0'}, logger_name='ipv4')
-    NETWORKS['ipv6'] = new_network({'local_addresses': '::'}, logger_name='ipv6')
+    new_networks = {}
+    new_networks[DEFAULT_NAME] = new_network({}, logger_name='default')
+    new_networks['ipv4'] = new_network({'local_addresses': '0.0.0.0'}, logger_name='ipv4')
+    new_networks['ipv6'] = new_network({'local_addresses': '::'}, logger_name='ipv6')
 
     # define networks from outgoing.networks
     for network_name, network in settings_outgoing['networks'].items():
-        NETWORKS[network_name] = new_network(network, logger_name=network_name)
+        new_networks[network_name] = new_network(network, logger_name=network_name)
 
     # define networks from engines.[i].network (except references)
     for engine_name, engine, network in iter_networks():
@@ -402,22 +548,46 @@ def initialize(
                     network[attribute_name] = getattr(engine, attribute_name)
                 else:
                     network[attribute_name] = attribute_value
-            NETWORKS[engine_name] = new_network(network, logger_name=engine_name)
+            new_networks[engine_name] = new_network(network, logger_name=engine_name)
         elif isinstance(network, dict):
-            NETWORKS[engine_name] = new_network(network, logger_name=engine_name)
+            new_networks[engine_name] = new_network(network, logger_name=engine_name)
 
     # define networks from engines.[i].network (references)
     for engine_name, engine, network in iter_networks():
         if isinstance(network, str):
-            NETWORKS[engine_name] = NETWORKS[network]
+            new_networks[engine_name] = new_networks[network]
 
     # the /image_proxy endpoint has a dedicated network.
     # same parameters than the default network, but HTTP/2 is disabled.
     # It decreases the CPU load average, and the total time is more or less the same
-    if 'image_proxy' not in NETWORKS:
+    if 'image_proxy' not in new_networks:
         image_proxy_params = default_params.copy()
         image_proxy_params['enable_http2'] = False
-        NETWORKS['image_proxy'] = new_network(image_proxy_params, logger_name='image_proxy')
+        new_networks['image_proxy'] = new_network(image_proxy_params, logger_name='image_proxy')
+
+    # Build and validate the complete replacement before stopping the active
+    # generation. A malformed reload must leave the running generation alive.
+    old_networks = list(dict.fromkeys(NETWORKS.values()))
+    if old_networks:
+        _close_network_generation(old_networks)
+    # Old references remain permanently retired. Readers see one complete map.
+    with _REGISTRY_LOCK:
+        NETWORKS.clear()
+        NETWORKS.update(new_networks)
+
+
+def _close_network_generation(networks):
+    loop = get_loop()
+    if loop:
+        future = asyncio.run_coroutine_threadsafe(Network.aclose_all(networks), loop)
+        try:
+            # wait 3 seconds to close the HTTP clients
+            future.result(3)
+        except BaseException:
+            future.cancel()
+            raise
+    else:
+        asyncio.run(Network.aclose_all(networks))
 
 
 @atexit.register
@@ -430,14 +600,13 @@ def done():
     Note: since Network.aclose has to be async, it is not possible to call this method on Network.__del__
     So Network.aclose is called here using atexit.register
     """
-    try:
-        loop = get_loop()
-        if loop:
-            future = asyncio.run_coroutine_threadsafe(Network.aclose_all(), loop)
-            # wait 3 seconds to close the HTTP clients
-            future.result(3)
-    finally:
-        NETWORKS.clear()
+    with _INITIALIZE_LOCK:
+        networks = list(dict.fromkeys(NETWORKS.values()))
+        try:
+            _close_network_generation(networks)
+        finally:
+            with _REGISTRY_LOCK:
+                NETWORKS.clear()
 
 
 NETWORKS[DEFAULT_NAME] = Network()

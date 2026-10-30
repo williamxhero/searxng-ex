@@ -142,8 +142,18 @@ def get_transport_for_socks_proxy(
 
 
 def get_transport(
-    verify: bool, http2: bool, local_address: str, proxy_url: str | None, limit: httpx.Limits, retries: int
+    verify: bool,
+    http2: bool,
+    local_address: str,
+    proxy_url: str | None,
+    limit: httpx.Limits,
+    retries: int,
+    protected: bool = False,
 ):
+    if protected:
+        from .protected import GuardedTransport  # pylint: disable=import-outside-toplevel
+
+        return GuardedTransport(verify=verify, proxy=proxy_url, local_address=local_address, limits=limit)
     _verify = get_sslcontexts(None, None, verify, True) if verify is True else verify
     return httpx.AsyncHTTPTransport(
         # pylint: disable=protected-access
@@ -169,6 +179,7 @@ def new_client(
     retries: int,
     max_redirects: int,
     hook_log_response: t.Callable[..., t.Any] | None,
+    protected: bool = False,
 ) -> httpx.AsyncClient:
     limit = httpx.Limits(
         max_connections=max_connections,
@@ -181,17 +192,21 @@ def new_client(
     for pattern, proxy_url in proxies.items():
         if not enable_http and pattern.startswith('http://'):
             continue
+        if protected and httpx.URL(proxy_url).scheme not in ('http', 'https'):
+            from wag_protection import ProtectionError  # pylint: disable=import-outside-toplevel
+
+            raise ProtectionError('route_unsupported')
         if proxy_url.startswith('socks4://') or proxy_url.startswith('socks5://') or proxy_url.startswith('socks5h://'):
             mounts[pattern] = get_transport_for_socks_proxy(
                 verify, enable_http2, local_address, proxy_url, limit, retries
             )
         else:
-            mounts[pattern] = get_transport(verify, enable_http2, local_address, proxy_url, limit, retries)
+            mounts[pattern] = get_transport(verify, enable_http2, local_address, proxy_url, limit, retries, protected)
 
     if not enable_http:
         mounts['http://'] = AsyncHTTPTransportNoHttp()
 
-    transport = get_transport(verify, enable_http2, local_address, None, limit, retries)
+    transport = get_transport(verify, enable_http2, local_address, None, limit, retries, protected)
 
     event_hooks = None
     if hook_log_response:

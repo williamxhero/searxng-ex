@@ -93,8 +93,27 @@ def _get_timeout(start_time: float, kwargs: t.Any) -> float:
     return timeout
 
 
+def _protected_dispatch():
+    from searx import settings  # pylint: disable=import-outside-toplevel
+
+    if settings['outgoing'].get('wag_protection', {}).get('enabled', False) is False:
+        return None
+    from .protected import _dispatch  # pylint: disable=import-outside-toplevel
+
+    return _dispatch()
+
+
 def request(method: str, url: str, **kwargs: t.Any) -> SXNG_Response:
     """same as requests/requests/api.py request(...)"""
+    context = _protected_dispatch()
+    if context is not None:
+        from wag_protection import ProtectionError  # pylint: disable=import-outside-toplevel
+
+        network = get_context_network()
+        if network is None or not network.protected:
+            raise ProtectionError('capability_refused')
+        with _record_http_time():
+            return context.run_async(lambda: network.request(method, url, **kwargs), get_loop())
     with _record_http_time() as start_time:
         network = get_context_network()
         timeout = _get_timeout(start_time, kwargs)
@@ -110,6 +129,10 @@ def request(method: str, url: str, **kwargs: t.Any) -> SXNG_Response:
 
 def multi_requests(request_list: list["Request"]) -> list[httpx.Response | Exception]:
     """send multiple HTTP requests in parallel. Wait for all requests to finish."""
+    if _protected_dispatch() is not None:
+        from wag_protection import ProtectionError  # pylint: disable=import-outside-toplevel
+
+        raise ProtectionError('helper_refused')
     with _record_http_time() as start_time:
         # send the requests
         network = get_context_network()
@@ -263,6 +286,10 @@ def stream(method: str, url: str, **kwargs: t.Any) -> tuple[SXNG_Response, Itera
     httpx.Client.stream requires to write the httpx.HTTPTransport version of the
     the httpx.AsyncHTTPTransport declared above.
     """
+    if _protected_dispatch() is not None:
+        from wag_protection import ProtectionError  # pylint: disable=import-outside-toplevel
+
+        raise ProtectionError('helper_refused')
     generator = _stream_generator(method, url, **kwargs)
 
     # yield response

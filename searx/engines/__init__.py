@@ -108,8 +108,9 @@ def load_engine(engine_data: dict[str, t.Any]) -> "Engine | types.ModuleType | N
     - required attribute is not set :py:func:`is_missing_required_attributes`
 
     """
-    # pylint: disable=too-many-return-statements
+    # pylint: disable=too-many-return-statements,too-many-branches
 
+    protected_load = settings['outgoing'].get('wag_protection', {}).get('enabled', False) is not False
     engine_name = engine_data.get('name')
     if engine_name is None:
         logger.error('An engine does not have a "name" field')
@@ -128,6 +129,17 @@ def load_engine(engine_data: dict[str, t.Any]) -> "Engine | types.ModuleType | N
     if module_name is None:
         logger.error('The "engine" field is missing for the engine named "{}"'.format(engine_name))
         return None
+    if protected_load:
+        from wag_protection import ProtectionError, Refusal  # pylint: disable=import-outside-toplevel
+        from searx.network.protected import (  # pylint: disable=import-outside-toplevel
+            get_store,
+            validate_engine_settings,
+            validate_engine_source,
+            validate_loaded_engine_source,
+        )
+
+        approved = validate_engine_settings(engine_data)
+        expected_source = validate_engine_source(engine_data, ENGINE_DIR, approved)
     try:
         engine = load_module(module_name + '.py', ENGINE_DIR)
     except (SyntaxError, KeyboardInterrupt, SystemExit, SystemError, ImportError, RuntimeError):
@@ -136,6 +148,12 @@ def load_engine(engine_data: dict[str, t.Any]) -> "Engine | types.ModuleType | N
     except BaseException:
         logger.exception('Cannot load engine "{}"'.format(module_name))
         return None
+
+    if protected_load:
+        store = get_store()
+        if isinstance(store, Refusal):
+            raise ProtectionError(store.reason)
+        validate_loaded_engine_source(engine, expected_source, approved, store.manifest)
 
     check_engine_module(engine)
     update_engine_attributes(engine, engine_data)

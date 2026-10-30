@@ -1273,6 +1273,7 @@ def config():
         _plugins.append({'name': _.id, 'enabled': _.active})
 
     _limiter_cfg = limiter.get_cfg()
+    from searx.network.protected import protection_descriptor  # pylint: disable=import-outside-toplevel
 
     return jsonify(
         {
@@ -1301,6 +1302,7 @@ def config():
             'doi_resolvers': list(settings['doi_resolvers'].keys()),
             'default_doi_resolver': settings['default_doi_resolver'],
             'public_instance': settings['server']['public_instance'],
+            'outbound_protection': protection_descriptor(),
         }
     )
 

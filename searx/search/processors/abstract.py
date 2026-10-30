@@ -142,6 +142,14 @@ class EngineProcessor(ABC):
             callback(self, False)
             return
 
+        from searx import settings  # pylint: disable=import-outside-toplevel
+
+        if settings['outgoing'].get('wag_protection', {}).get('enabled', False) is True:
+            # Only prevalidated local init is allowed; network helpers reject
+            # without a send-phase dispatch before they schedule anything.
+            callback(self, self.init_engine())
+            return
+
         def __init_processor_thread():
             eng_ok = self.init_engine()
             callback(self, eng_ok)

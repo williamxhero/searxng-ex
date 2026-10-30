@@ -2,6 +2,8 @@
 # pylint: disable=missing-module-docstring,disable=missing-class-docstring,invalid-name
 
 
+import threading
+
 from searx.result_types import LegacyResult
 from searx.results import ResultContainer
 from tests import SearxTestCase
@@ -11,6 +13,51 @@ class ResultContainerTestCase(SearxTestCase):
     # pylint: disable=use-dict-literal
 
     TEST_SETTINGS = "test_result_container.yml"
+
+    def test_close_waits_for_inflight_extension_and_seals_evidence(self):
+        container = ResultContainer()
+        entered, release, closed = threading.Event(), threading.Event(), threading.Event()
+
+        def on_result(_):
+            entered.set()
+            release.wait(3)
+            return True
+
+        container.on_result = on_result
+        snapshot = {'status': 'unfinished', 'engines': [{'engine': 'bing', 'status': 'unfinished'}]}
+        container.set_outbound_protection(snapshot)
+        snapshot['engines'][0]['status'] = 'admitted'
+        worker = threading.Thread(
+            target=container.extend,
+            args=('google', [dict(url='https://fixture.invalid/first', title='First', content='Synthetic')]),
+        )
+
+        def close():
+            container.close()
+            closed.set()
+
+        closer = threading.Thread(target=close)
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(1))
+            closer.start()
+            self.assertFalse(closed.wait(0.05), 'close raced past an in-flight extension')
+        finally:
+            release.set()
+            worker.join(3)
+            if closer.ident is not None:
+                closer.join(3)
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(closer.is_alive())
+        self.assertEqual(len(container.get_ordered_results()), 1)
+        container.extend('google', [dict(url='https://fixture.invalid/late', title='Late')])
+        self.assertEqual(len(container.get_ordered_results()), 1)
+        self.assertEqual(container.outbound_protection['engines'][0]['status'], 'unfinished')
+        detached = container.outbound_protection
+        detached['status'] = 'complete'
+        self.assertEqual(container.outbound_protection['status'], 'unfinished')
+        with self.assertRaises(RuntimeError):
+            container.set_outbound_protection({'status': 'complete'})
 
     def test_empty(self):
         container = ResultContainer()
